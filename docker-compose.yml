@@ -1,0 +1,50 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    ports:
+      - "5000:5000"
+    environment:
+      - MONGO_URI=mongodb://mongodb:27017/pos2
+      - JWT_SECRET=change-this-secret-in-production
+    depends_on:
+      mongodb:
+        condition: service_started
+    volumes:
+      - ./apps/api:/app/apps/api
+      - ./packages:/app/packages
+
+  cashier:
+    build:
+      context: .
+      dockerfile: apps/cashier/Dockerfile
+    ports:
+      - "3001:3001"
+    depends_on:
+      - api
+    volumes:
+      - ./apps/cashier:/app/apps/cashier
+      - ./packages:/app/packages
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: apps/dashboard/Dockerfile
+    ports:
+      - "3000:3000"
+    depends_on:
+      - api
+    volumes:
+      - ./apps/dashboard:/app/apps/dashboard
+      - ./packages:/app/packages
+
+  mongodb:
+    image: mongo:7
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+
+volumes:
+  mongo_data:

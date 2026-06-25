@@ -1,0 +1,168 @@
+import { useState, useEffect } from 'react';
+import { useAuth } from '../context/AuthContext';
+
+interface Member {
+  _id: string;
+  name: string;
+  phone: string;
+  email?: string;
+  tier: string;
+  totalOrders: number;
+  totalSpend: number;
+  notes?: string;
+  createdAt: string;
+}
+
+const TIERS = ['regular', 'silver', 'gold', 'platinum'];
+
+function tierColor(tier: string) {
+  switch (tier) {
+    case 'platinum': return 'bg-purple-100 text-purple-700 border-purple-200';
+    case 'gold': return 'bg-yellow-100 text-yellow-700 border-yellow-200';
+    case 'silver': return 'bg-gray-100 text-gray-600 border-gray-200';
+    default: return 'bg-surface-container-high text-on-surface-variant border-outline-variant';
+  }
+}
+
+export default function Members() {
+  const { token } = useAuth();
+  const [members, setMembers] = useState<Member[]>([]);
+  const [showForm, setShowForm] = useState(false);
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [form, setForm] = useState({ name: '', phone: '', email: '', tier: 'regular', notes: '' });
+
+  const headers = { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` };
+
+  useEffect(() => {
+    fetch('/api/members', { headers }).then((r) => r.json()).then(setMembers);
+  }, []);
+
+  function resetForm() {
+    setForm({ name: '', phone: '', email: '', tier: 'regular', notes: '' });
+  }
+
+  async function save() {
+    if (!form.name || !form.phone) return;
+    const url = editingId ? `/api/members/${editingId}` : '/api/members';
+    const method = editingId ? 'PUT' : 'POST';
+    const res = await fetch(url, { method, headers, body: JSON.stringify(form) });
+    if (!res.ok) {
+      const data = await res.json();
+      alert(data.message || 'Gagal menyimpan');
+      return;
+    }
+    setShowForm(false);
+    setEditingId(null);
+    resetForm();
+    fetch('/api/members', { headers }).then((r) => r.json()).then(setMembers);
+  }
+
+  async function remove(id: string) {
+    if (!confirm('Hapus member?')) return;
+    await fetch(`/api/members/${id}`, { method: 'DELETE', headers });
+    fetch('/api/members', { headers }).then((r) => r.json()).then(setMembers);
+  }
+
+  function edit(m: Member) {
+    setForm({ name: m.name, phone: m.phone, email: m.email || '', tier: m.tier, notes: m.notes || '' });
+    setEditingId(m._id);
+    setShowForm(true);
+  }
+
+  return (
+    <div className="flex flex-col gap-4">
+      <div className="flex justify-between items-center">
+        <div className="flex items-center gap-3">
+          <span className="material-symbols-outlined text-primary text-[24px]">diversity_3</span>
+          <h3 className="font-headline-sm text-headline-sm text-on-surface uppercase font-bold tracking-tight">MEMBER</h3>
+        </div>
+        <button onClick={() => { setShowForm(true); setEditingId(null); resetForm(); }}
+          className="flex items-center gap-2 px-4 py-2 bg-primary text-white font-bold rounded-lg hover:bg-primary/90 transition-colors shadow-sm">
+          <span className="material-symbols-outlined text-[18px]">add</span>Tambah Member
+        </button>
+      </div>
+
+      <div className="bg-white border border-outline-variant rounded-lg overflow-hidden shadow-sm">
+        <div className="overflow-x-auto">
+          <table className="w-full text-left border-collapse">
+            <thead className="bg-surface-container-highest/50 border-b border-outline-variant">
+              <tr>
+                <th className="p-table_cell_padding font-section-header text-section-header text-outline uppercase tracking-wider">Nama</th>
+                <th className="p-table_cell_padding font-section-header text-section-header text-outline uppercase tracking-wider">Telepon</th>
+                <th className="p-table_cell_padding font-section-header text-section-header text-outline uppercase tracking-wider">Email</th>
+                <th className="p-table_cell_padding font-section-header text-section-header text-outline uppercase tracking-wider">Tier</th>
+                <th className="p-table_cell_padding font-section-header text-section-header text-outline uppercase tracking-wider">Pesanan</th>
+                <th className="p-table_cell_padding font-section-header text-section-header text-outline uppercase tracking-wider">Total Belanja</th>
+                <th className="p-table_cell_padding font-section-header text-section-header text-outline uppercase tracking-wider">Aksi</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-outline-variant">
+              {members.map((m) => (
+                <tr key={m._id} className="table-row-hover transition-colors">
+                  <td className="p-table_cell_padding font-body-md text-body-md text-on-surface font-semibold">{m.name}</td>
+                  <td className="p-table_cell_padding font-body-md text-body-md text-on-surface-variant">{m.phone}</td>
+                  <td className="p-table_cell_padding font-body-md text-body-md text-on-surface-variant">{m.email || '-'}</td>
+                  <td className="p-table_cell_padding">
+                    <span className={`text-xs font-semibold px-2 py-0.5 rounded border ${tierColor(m.tier)}`}>
+                      {m.tier.charAt(0).toUpperCase() + m.tier.slice(1)}
+                    </span>
+                  </td>
+                  <td className="p-table_cell_padding font-body-md text-body-md">{m.totalOrders}</td>
+                  <td className="p-table_cell_padding font-body-md text-body-md">Rp {m.totalSpend.toLocaleString()}</td>
+                  <td className="p-table_cell_padding">
+                    <div className="flex items-center gap-2">
+                      <button onClick={() => edit(m)}
+                        className="flex items-center gap-1 px-3 py-1.5 text-xs font-semibold text-primary bg-primary/10 rounded-lg hover:bg-primary/20 transition-colors">
+                        <span className="material-symbols-outlined text-[16px]">edit</span>Edit
+                      </button>
+                      <button onClick={() => remove(m._id)}
+                        className="flex items-center gap-1 px-3 py-1.5 text-xs font-semibold text-error bg-error/10 rounded-lg hover:bg-error/20 transition-colors">
+                        <span className="material-symbols-outlined text-[16px]">delete</span>Hapus
+                      </button>
+                    </div>
+                  </td>
+                </tr>
+              ))}
+              {members.length === 0 && (
+                <tr><td colSpan={7} className="p-table_cell_padding text-center text-on-surface-variant">Belum ada member</td></tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {showForm && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+          <div className="bg-white rounded-xl shadow-xl w-full max-w-md mx-4 p-6 border border-outline-variant">
+            <h3 className="font-headline-sm text-headline-sm text-on-surface mb-4">{editingId ? 'Edit Member' : 'Tambah Member'}</h3>
+            <div className="flex flex-col gap-3">
+              <input placeholder="Nama" value={form.name}
+                onChange={(e) => setForm({ ...form, name: e.target.value })}
+                className="w-full px-3 py-2 border border-outline-variant rounded-lg font-body-md text-body-md focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary" />
+              <input placeholder="Nomor Telepon" value={form.phone}
+                onChange={(e) => setForm({ ...form, phone: e.target.value })}
+                className="w-full px-3 py-2 border border-outline-variant rounded-lg font-body-md text-body-md focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary" />
+              <input placeholder="Email (opsional)" value={form.email}
+                onChange={(e) => setForm({ ...form, email: e.target.value })}
+                className="w-full px-3 py-2 border border-outline-variant rounded-lg font-body-md text-body-md focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary" />
+              <select value={form.tier}
+                onChange={(e) => setForm({ ...form, tier: e.target.value })}
+                className="w-full px-3 py-2 border border-outline-variant rounded-lg font-body-md text-body-md focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary">
+                {TIERS.map((t) => <option key={t} value={t}>{t.charAt(0).toUpperCase() + t.slice(1)}</option>)}
+              </select>
+              <textarea placeholder="Catatan (opsional)" value={form.notes}
+                onChange={(e) => setForm({ ...form, notes: e.target.value })}
+                rows={2} className="w-full px-3 py-2 border border-outline-variant rounded-lg font-body-md text-body-md focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary" />
+            </div>
+            <div className="flex items-center justify-end gap-3 mt-6">
+              <button onClick={() => { setShowForm(false); setEditingId(null); resetForm(); }}
+                className="px-4 py-2 text-sm font-semibold text-on-surface-variant bg-surface-container-low rounded-lg hover:bg-surface-container-high transition-colors">Batal</button>
+              <button onClick={save}
+                className="px-4 py-2 text-sm font-bold text-white bg-primary rounded-lg hover:bg-primary/90 transition-colors shadow-sm">Simpan</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}

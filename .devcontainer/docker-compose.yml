@@ -1,0 +1,28 @@
+services:
+  mongodb:
+    image: mongo:7
+    restart: unless-stopped
+    ports:
+      - "27018:27017"
+      - "3000:3000"
+      - "3001:3001"
+      - "5001:5000"
+    volumes:
+      - mongo-data:/data/db
+
+  devcontainer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - ..:/workspace:cached
+    command: sleep infinity
+    network_mode: service:mongodb
+    environment:
+      - MONGO_URI=mongodb://localhost:27017/pos2
+      - JWT_SECRET=dev-secret-change-in-production
+    depends_on:
+      - mongodb
+
+volumes:
+  mongo-data:

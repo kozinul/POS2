@@ -1,0 +1,55 @@
+{
+  "name": "POS2 - MERN Monorepo",
+  "dockerComposeFile": "docker-compose.yml",
+  "service": "devcontainer",
+  "workspaceFolder": "/workspace",
+
+  "forwardPorts": [
+    3000,
+    3001,
+    5001,
+    27018
+  ],
+
+  "portsAttributes": {
+    "3000": {
+      "label": "Dashboard",
+      "onAutoForward": "openBrowser"
+    },
+    "3001": {
+      "label": "Cashier",
+      "onAutoForward": "openBrowser"
+    },
+    "5001": {
+      "label": "API",
+      "onAutoForward": "silent"
+    },
+    "27018": {
+      "label": "MongoDB",
+      "onAutoForward": "silent"
+    }
+  },
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "dbaeumer.vscode-eslint",
+        "esbenp.prettier-vscode",
+        "ms-vscode.vscode-typescript-next",
+        "mongodb.mongodb-vscode",
+        "bradlc.vscode-tailwindcss",
+        "dsznajder.es7-react-js-snippets"
+      ],
+      "settings": {
+        "editor.formatOnSave": true,
+        "editor.defaultFormatter": "esbenp.prettier-vscode",
+        "typescript.updateImportsOnFileMove.enabled": "always"
+      }
+    }
+  },
+
+  "postCreateCommand": "pnpm install",
+  "postStartCommand": "pnpm --filter @pos/api exec tsx src/seed.ts || true",
+
+  "remoteUser": "node"
+}
