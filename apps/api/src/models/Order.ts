@@ -14,11 +14,17 @@ interface ITaxDetail {
   included?: boolean;
 }
 
+interface IOrderItemModifier {
+  name: string;
+  price: number;
+}
+
 interface IOrderItem {
   product: mongoose.Types.ObjectId;
   qty: number;
   price: number;
   subtotal: number;
+  modifiers?: IOrderItemModifier[];
 }
 
 interface IVoidedItem {
@@ -63,6 +69,7 @@ export interface IOrderDoc extends Document {
   voidedItems?: IVoidedItem[];
   voidedAt?: Date;
   voidedBy?: mongoose.Types.ObjectId;
+  voidedByName?: string;
   voidReason?: string;
   createdAt: Date;
 }
@@ -77,12 +84,21 @@ const taxDetailSchema = new Schema<ITaxDetail>(
   { _id: false }
 );
 
+const orderItemModifierSchema = new Schema<IOrderItemModifier>(
+  {
+    name: { type: String, required: true },
+    price: { type: Number, default: 0 },
+  },
+  { _id: false }
+);
+
 const orderItemSchema = new Schema<IOrderItem>(
   {
     product: { type: Schema.Types.ObjectId, ref: 'Product', required: true },
     qty: { type: Number, required: true, min: 1 },
     price: { type: Number, required: true },
     subtotal: { type: Number, required: true },
+    modifiers: [orderItemModifierSchema],
   },
   { _id: true }
 );
@@ -133,6 +149,7 @@ const orderSchema = new Schema<IOrderDoc>(
     voidedItems: [voidedItemSchema],
     voidedAt: Date,
     voidedBy: { type: Schema.Types.ObjectId, ref: 'User' },
+    voidedByName: String,
     voidReason: String,
   },
   { timestamps: true }

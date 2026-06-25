@@ -61,24 +61,27 @@ export async function createOrder(req: AuthRequest, res: Response) {
     for (const item of items) {
       const product = await Product.findById(item.product).populate(['category', 'taxes.tax']);
       if (!product) return res.status(404).json({ message: `Product ${item.product} not found` });
-      if (product.stock < item.qty) {
-        return res.status(400).json({ message: `Insufficient stock for ${product.name}` });
+      if (product.stockManagement && product.stock < item.qty) {
+        return res.status(400).json({ message: `Stok ${product.name} tidak mencukupi` });
       }
 
-      const lineTotal = product.price * item.qty;
+      const modTotal = (item.modifiers || []).reduce((s: number, m: any) => s + (m.price || 0), 0);
+      const effectivePrice = product.price + modTotal;
+      const lineTotal = effectivePrice * item.qty;
       subtotal += lineTotal;
       orderItems.push({
         product: product._id,
         qty: item.qty,
-        price: product.price,
+        price: effectivePrice,
         subtotal: lineTotal,
+        modifiers: item.modifiers || [],
       });
       const cat = product.category as any;
       cartItems.push({
         product: {
           _id: String(product._id),
           name: product.name,
-          price: product.price,
+          price: effectivePrice,
           category: cat?._id ? String(cat._id) : String(product.category),
         },
         qty: item.qty,
@@ -221,7 +224,10 @@ export async function createOrder(req: AuthRequest, res: Response) {
 
     for (const item of orderItems) {
       if (item.price > 0) {
-        await Product.findByIdAndUpdate(item.product, { $inc: { stock: -item.qty } });
+        const prod = await Product.findById(item.product).select('stockManagement');
+        if (prod && prod.stockManagement) {
+          await Product.findByIdAndUpdate(item.product, { $inc: { stock: -item.qty } });
+        }
       }
     }
 
@@ -328,7 +334,7 @@ export async function getDailyReport(_req: AuthRequest, res: Response) {
 
 export async function voidOrder(req: AuthRequest, res: Response) {
   try {
-    const { reason } = req.body;
+    const { reason, supervisorId, voidedByName } = req.body;
     const order = await Order.findById(req.params.id);
     if (!order) return res.status(404).json({ message: 'Order not found' });
     if (order.status === 'voided') return res.status(400).json({ message: 'Order sudah di-void' });
@@ -340,20 +346,26 @@ export async function voidOrder(req: AuthRequest, res: Response) {
         .reduce((s, vi) => s + vi.qty, 0);
       const remainingQty = item.qty - alreadyVoidedQty;
       if (remainingQty > 0 && item.price > 0) {
-        await Product.findByIdAndUpdate(item.product, { $inc: { stock: remainingQty } });
+        const prod = await Product.findById(item.product).select('stockManagement');
+        if (prod && prod.stockManagement) {
+          await Product.findByIdAndUpdate(item.product, { $inc: { stock: remainingQty } });
+        }
       }
     }
+
+    const voidedById = supervisorId || req.user!.id;
 
     await Order.findByIdAndUpdate(req.params.id, {
       $set: {
         status: 'voided',
         voidedAt: new Date(),
-        voidedBy: req.user!.id,
+        voidedBy: voidedById,
+        voidedByName: voidedByName || '',
         voidReason: reason || '',
       },
     });
 
-    const updated = await Order.findById(req.params.id).populate(['items.product', 'paymentMethod', 'cashier']);
+    const updated = await Order.findById(req.params.id).populate(['items.product', 'paymentMethod', 'cashier', 'voidedBy']);
     res.json(updated);
   } catch (err: any) {
     res.status(500).json({ message: err.message });
@@ -362,7 +374,7 @@ export async function voidOrder(req: AuthRequest, res: Response) {
 
 export async function voidItem(req: AuthRequest, res: Response) {
   try {
-    const { itemId, qty, reason } = req.body;
+    const { itemId, qty, reason, supervisorId, voidedByName } = req.body;
     const order = await Order.findById(req.params.id).populate<{ items: any[] }>('items.product');
     if (!order) return res.status(404).json({ message: 'Order not found' });
     if (order.status === 'voided') return res.status(400).json({ message: 'Order sudah di-void' });
@@ -382,7 +394,9 @@ export async function voidItem(req: AuthRequest, res: Response) {
       return res.status(400).json({ message: `Hanya ${remainingAvail} item tersisa untuk di-void` });
     }
 
-    const user = await User.findById(req.user!.id);
+    const voidedById = supervisorId || req.user!.id;
+    const voidedByNameValue = voidedByName || '';
+
     const voidedEntry = {
       itemId: orderItem._id,
       product: orderItem.product._id,
@@ -391,8 +405,8 @@ export async function voidItem(req: AuthRequest, res: Response) {
       price: orderItem.price,
       reason: reason || '',
       voidedAt: new Date(),
-      voidedBy: req.user!.id,
-      voidedByName: user?.name || '',
+      voidedBy: voidedById,
+      voidedByName: voidedByNameValue,
     };
 
     order.voidedItems = [...(order.voidedItems || []), voidedEntry as any];
@@ -406,11 +420,22 @@ export async function voidItem(req: AuthRequest, res: Response) {
     });
     order.status = allFullyVoided ? 'voided' : 'partially-voided';
 
+    // Also set order-level void info when fully voided
+    if (allFullyVoided) {
+      order.voidedAt = new Date();
+      order.voidedBy = voidedById as any;
+      order.voidedByName = voidedByNameValue;
+      order.voidReason = reason || '';
+    }
+
     await order.save();
 
     // Restore stock
     if (orderItem.price > 0) {
-      await Product.findByIdAndUpdate(orderItem.product._id, { $inc: { stock: voidQty } });
+      const prod = await Product.findById(orderItem.product._id).select('stockManagement');
+      if (prod && prod.stockManagement) {
+        await Product.findByIdAndUpdate(orderItem.product._id, { $inc: { stock: voidQty } });
+      }
     }
 
     const updated = await Order.findById(order._id).populate(['items.product', 'paymentMethod', 'cashier', 'voidedItems.voidedBy']);
@@ -420,25 +445,55 @@ export async function voidItem(req: AuthRequest, res: Response) {
   }
 }
 
-export async function reopenOrder(req: AuthRequest, res: Response) {
+export async function voidPayment(req: AuthRequest, res: Response) {
   try {
-    const order = await Order.findById(req.params.id);
+    const { reason, supervisorId, voidedByName } = req.body;
+    const order = await Order.findById(req.params.id).populate<{ items: any[] }>('items.product');
     if (!order) return res.status(404).json({ message: 'Order not found' });
-    if (order.status !== 'voided') return res.status(400).json({ message: 'Hanya order yang di-void bisa dibuka ulang' });
+    if (order.status !== 'completed') return res.status(400).json({ message: 'Hanya order completed yang bisa di-void payment' });
 
-    // Restore stock back (re-consume)
+    const voidedById = supervisorId || req.user!.id;
+
+    // Restore stock
     for (const item of order.items) {
-      if (item.price > 0) {
-        await Product.findByIdAndUpdate(item.product, { $inc: { stock: -item.qty } });
+      const alreadyVoidedQty = (order.voidedItems || [])
+        .filter((vi) => String(vi.itemId) === String((item as any)._id))
+        .reduce((s, vi) => s + vi.qty, 0);
+      const remainingQty = item.qty - alreadyVoidedQty;
+      if (remainingQty > 0 && item.price > 0) {
+        const prod = await Product.findById(item.product).select('stockManagement');
+        if (prod && prod.stockManagement) {
+          await Product.findByIdAndUpdate(item.product, { $inc: { stock: remainingQty } });
+        }
       }
     }
 
-    // Clear void data
-    order.status = 'completed';
-    order.voidedAt = undefined;
-    order.voidedBy = undefined;
-    order.voidReason = undefined;
-    order.voidedItems = [];
+    // Build voided items for all non-voided items
+    const voidedEntries = order.items
+      .filter((item) => {
+        const alreadyVoided = (order.voidedItems || [])
+          .filter((vi) => String(vi.itemId) === String((item as any)._id))
+          .reduce((s, vi) => s + vi.qty, 0);
+        return item.qty - alreadyVoided > 0;
+      })
+      .map((item) => ({
+        itemId: (item as any)._id,
+        product: item.product,
+        productName: (item.product as any)?.name || '',
+        qty: item.qty,
+        price: item.price,
+        reason: `Void payment: ${reason || ''}`,
+        voidedAt: new Date(),
+        voidedBy: voidedById,
+        voidedByName: voidedByName || '',
+      }));
+
+    order.voidedItems = [...(order.voidedItems || []), ...voidedEntries] as any;
+    order.status = 'voided';
+    order.voidedAt = new Date();
+    order.voidedBy = voidedById as any;
+    order.voidedByName = voidedByName || '';
+    order.voidReason = `Void payment: ${reason || ''}`;
     await order.save();
 
     const updated = await Order.findById(order._id).populate(['items.product', 'paymentMethod', 'cashier']);

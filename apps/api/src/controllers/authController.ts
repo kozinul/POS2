@@ -35,3 +35,22 @@ export async function getMe(req: Request, res: Response) {
     res.status(500).json({ message: err.message });
   }
 }
+
+export async function verifySupervisor(req: Request, res: Response) {
+  try {
+    const { userId, password } = req.body;
+    const user = await User.findOne({ userId: userId?.toLowerCase() }).populate<{ roleRef: any }>('roleRef');
+    if (!user || !(await bcrypt.compare(password, user.password))) {
+      return res.status(401).json({ message: 'ID atau password salah' });
+    }
+
+    const hasVoidPermission = user.role === 'admin' || (user.roleRef?.permissions || []).includes('sales.void');
+    if (!hasVoidPermission) {
+      return res.status(403).json({ message: 'User tidak memiliki izin void' });
+    }
+
+    res.json({ user: { id: user._id, name: user.name, userId: user.userId } });
+  } catch (err: any) {
+    res.status(500).json({ message: err.message });
+  }
+}

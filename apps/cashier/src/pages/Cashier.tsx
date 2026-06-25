@@ -18,6 +18,7 @@ interface Product {
   name: string;
   price: number;
   stock: number;
+  stockManagement?: boolean;
   image?: string;
   taxes: { tax: { _id: string; name: string; rate: number }; included: boolean }[];
   category: { name: string; family: { _id: string; name: string } } | string;
@@ -122,6 +123,14 @@ export default function Cashier() {
   const [voidItemSelections, setVoidItemSelections] = useState<{ [itemId: string]: number }>({});
   const [showVoidItemModal, setShowVoidItemModal] = useState(false);
   const [voidItemReason, setVoidItemReason] = useState('');
+
+  // Supervisor verification for void
+  const [showSupervisorAuth, setShowSupervisorAuth] = useState(false);
+  const [supervisorUserId, setSupervisorUserId] = useState('');
+  const [supervisorPassword, setSupervisorPassword] = useState('');
+  const [supervisorError, setSupervisorError] = useState('');
+  const [supervisorData, setSupervisorData] = useState<{ id: string; name: string } | null>(null);
+  const [pendingVoidAction, setPendingVoidAction] = useState<'void-all' | 'void-item' | 'void-payment' | null>(null);
   const [historyFilter, setHistoryFilter] = useState('today');
   const [historyPage, setHistoryPage] = useState(1);
   const [historyTotalPages, setHistoryTotalPages] = useState(1);
@@ -203,7 +212,7 @@ export default function Cashier() {
     setCart((prev) => {
       const existing = prev.find((item) => item.product._id === product._id && !item.modifiers?.length);
       if (existing) {
-        if (existing.qty >= product.stock) return prev;
+        if (product.stockManagement && existing.qty >= product.stock) return prev;
         return prev.map((item) =>
           item.product._id === product._id && !item.modifiers?.length ? { ...item, qty: item.qty + 1 } : item
         );
@@ -395,6 +404,7 @@ export default function Cashier() {
           product: item.product._id,
           qty: item.qty,
           price: item.product.price,
+          modifiers: item.modifiers || [],
         })),
         paymentMethod: selectedPM?._id,
         cashAmount: isCash ? Number(cashAmount) : undefined,
@@ -511,13 +521,48 @@ export default function Cashier() {
     setShowOrderDetail(false);
   }
 
+  async function verifySupervisor() {
+    try {
+      setSupervisorError('');
+      const res = await fetch('/api/auth/verify-supervisor', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userId: supervisorUserId, password: supervisorPassword }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setSupervisorData(data.user);
+        setShowSupervisorAuth(false);
+        setSupervisorPassword('');
+        setSupervisorUserId('');
+        if (pendingVoidAction === 'void-all') {
+          setShowVoidModal(true);
+        } else if (pendingVoidAction === 'void-item') {
+          openVoidItemModal(selectedOrder);
+        } else if (pendingVoidAction === 'void-payment') {
+          voidPaymentOrder();
+        }
+      } else {
+        const err = await res.json();
+        setSupervisorError(err.message || 'Verifikasi gagal');
+      }
+    } catch {
+      setSupervisorError('Gagal terhubung ke server');
+    }
+  }
+
   async function confirmVoidOrder() {
     if (!selectedOrder) return;
     const token = localStorage.getItem('token');
+    const body: any = { reason: voidReason };
+    if (supervisorData) {
+      body.supervisorId = supervisorData.id;
+      body.voidedByName = supervisorData.name;
+    }
     const res = await fetch(`/api/orders/${selectedOrder._id}/void`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-      body: JSON.stringify({ reason: voidReason }),
+      body: JSON.stringify(body),
     });
     if (res.ok) {
       const updated = await res.json();
@@ -525,25 +570,42 @@ export default function Cashier() {
       setSelectedOrder(updated);
       setShowVoidModal(false);
       setVoidReason('');
+      setSupervisorData(null);
     } else {
       const err = await res.json();
       alert(err.message || 'Gagal void order');
     }
   }
 
-  async function reopenOrder(orderId: string) {
+  async function voidPaymentOrder() {
+    if (!selectedOrder) return;
     const token = localStorage.getItem('token');
-    const res = await fetch(`/api/orders/${orderId}/reopen`, {
+    const body: any = { reason: `Void payment` };
+    if (supervisorData) {
+      body.supervisorId = supervisorData.id;
+      body.voidedByName = supervisorData.name;
+    }
+    const res = await fetch(`/api/orders/${selectedOrder._id}/void-payment`, {
       method: 'POST',
-      headers: { Authorization: `Bearer ${token}` },
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify(body),
     });
     if (res.ok) {
       const updated = await res.json();
       setOrders((prev) => prev.map((o) => (o._id === updated._id ? updated : o)));
-      if (selectedOrder?._id === orderId) setSelectedOrder(updated);
+      // Return items to cart
+      const items: CartItem[] = updated.items.map((item: any) => ({
+        product: item.product,
+        qty: item.qty,
+        modifiers: item.modifiers || [],
+      }));
+      setCart(items);
+      setShowOrderDetail(false);
+      setShowPaymentModal(true);
+      setSupervisorData(null);
     } else {
       const err = await res.json();
-      alert(err.message || 'Gagal membuka ulang order');
+      alert(err.message || 'Gagal void payment');
     }
   }
 
@@ -612,10 +674,15 @@ export default function Cashier() {
 
     const token = localStorage.getItem('token');
     for (const [itemId, qty] of entries) {
+      const body: any = { itemId, qty, reason: voidItemReason };
+      if (supervisorData) {
+        body.supervisorId = supervisorData.id;
+        body.voidedByName = supervisorData.name;
+      }
       const res = await fetch(`/api/orders/${selectedOrder._id}/void-item`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-        body: JSON.stringify({ itemId, qty, reason: voidItemReason }),
+        body: JSON.stringify(body),
       });
       if (!res.ok) {
         const err = await res.json();
@@ -634,6 +701,7 @@ export default function Cashier() {
     }
     setShowVoidItemModal(false);
     setVoidItemReason('');
+    setSupervisorData(null);
   }
 
   function confirmModifierSelection() {
@@ -644,7 +712,7 @@ export default function Cashier() {
       const key = cartId(newItem);
       const existing = prev.find((item) => cartId(item) === key);
       if (existing) {
-        if (existing.qty >= modifierProduct.stock) return prev;
+        if (modifierProduct.stockManagement && existing.qty >= modifierProduct.stock) return prev;
         return prev.map((item) =>
           cartId(item) === key ? { ...item, qty: item.qty + 1 } : item
         );
@@ -776,32 +844,30 @@ export default function Cashier() {
                   </button>
                 ))}
               </div>
-              {selectedFamily && (
-                <div className="flex gap-2 flex-wrap ml-1">
-                  {categories
-                    .filter((c) => c.family?._id === selectedFamily)
-                    .map((cat) => (
-                      <button
-                        key={cat._id}
-                        onClick={() => setSelectedCategory(cat._id)}
-                        className={`px-4 py-1.5 rounded-full font-medium text-xs ${
-                          selectedCategory === cat._id
-                            ? 'bg-[#2176D2] text-white'
-                            : 'bg-gray-100 text-gray-600'
-                        }`}
-                      >
-                        {cat.name}
-                      </button>
-                    ))}
-                </div>
-              )}
+              <div className="flex gap-2 flex-wrap ml-1">
+                {categories
+                  .filter((c) => !selectedFamily || c.family?._id === selectedFamily)
+                  .map((cat) => (
+                    <button
+                      key={cat._id}
+                      onClick={() => { setShowPopular(false); setSelectedCategory(cat._id); }}
+                      className={`px-4 py-1.5 rounded-full font-medium text-xs ${
+                        selectedCategory === cat._id
+                          ? 'bg-[#2176D2] text-white'
+                          : 'bg-gray-100 text-gray-600'
+                      }`}
+                    >
+                      {cat.name}
+                    </button>
+                  ))}
+              </div>
             </div>
           </div>
 
           {/* Product Grid */}
           <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-6">
             {products.map((product) => {
-              const outOfStock = product.stock === 0;
+              const outOfStock = product.stockManagement !== false && product.stock === 0;
               const promo = hasActivePromo(product);
               return (
                 <div
@@ -857,7 +923,7 @@ export default function Cashier() {
                     </p>
                     <div className="mt-auto pt-4 flex items-center justify-between">
                       <span className={`text-xs ${outOfStock ? 'text-red-500 font-medium' : 'text-gray-500'}`}>
-                        Stok: {outOfStock ? 'Habis' : product.stock}
+                        {product.stockManagement === false ? 'Tanpa stok' : `Stok: ${outOfStock ? 'Habis' : product.stock}`}
                       </span>
                       <button
                         disabled={outOfStock}
@@ -942,7 +1008,7 @@ export default function Cashier() {
                     <div className="flex gap-2">
                       <button
                         onClick={() => updateQty(cartId(item), 1)}
-                        disabled={item.qty >= item.product.stock}
+                        disabled={item.product.stockManagement && item.qty >= item.product.stock}
                         className="text-gray-300 hover:text-[#2176D2] disabled:opacity-30"
                       >
                         <span className="material-symbols-outlined text-[20px]">add_circle</span>
@@ -1322,9 +1388,21 @@ export default function Cashier() {
                   ?.filter((vi: any) => String(vi.itemId) === String(item._id))
                   ?.reduce((s: number, vi: any) => s + vi.qty, 0) || 0;
                 return (
-                  <div key={i} className="flex justify-between text-sm">
-                    <span className="text-gray-700">{item.product?.name} <span className="text-gray-400">x{item.qty}</span></span>
-                    <span className="font-semibold">Rp {item.subtotal?.toLocaleString()}</span>
+                  <div key={i} className="text-sm">
+                    <div className="flex justify-between">
+                      <span className="text-gray-700">{item.product?.name} <span className="text-gray-400">x{item.qty}</span></span>
+                      <span className="font-semibold">Rp {item.subtotal?.toLocaleString()}</span>
+                    </div>
+                    {item.modifiers?.length > 0 && (
+                      <div className="text-xs text-gray-400 ml-3 mt-0.5 space-y-0.5">
+                        {item.modifiers.map((m: any, mi: number) => (
+                          <div key={mi} className="flex justify-between">
+                            <span>+ {m.name}</span>
+                            {m.price > 0 && <span>Rp {m.price.toLocaleString()}</span>}
+                          </div>
+                        ))}
+                      </div>
+                    )}
                   </div>
                 );
               })}
@@ -1358,9 +1436,15 @@ export default function Cashier() {
                 <h4 className="text-xs font-bold text-red-500 mb-1">VOID:</h4>
                 {lastOrder.voidedItems.map((vi: any, i: number) => (
                   <div key={i} className="flex justify-between text-xs text-red-400">
-                    <span>{vi.productName || 'Unknown'} x{vi.qty}{vi.reason && ` (${vi.reason})`}</span>
+                    <span>{vi.productName || 'Unknown'} x{vi.qty}{vi.reason && ` (${vi.reason})`}{vi.voidedByName && <span className="text-gray-400 ml-1">- {vi.voidedByName}</span>}</span>
                   </div>
                 ))}
+              </div>
+            )}
+            {(lastOrder.status === 'voided' || lastOrder.status === 'partially-voided') && (lastOrder.voidedByName || lastOrder.voidReason) && (
+              <div className="border-t border-gray-100 pt-2 mt-2 text-xs text-red-500 space-y-0.5">
+                {lastOrder.voidedByName && <p>Dibatal oleh: {lastOrder.voidedByName}</p>}
+                {lastOrder.voidReason && <p>Alasan: {lastOrder.voidReason}</p>}
               </div>
             )}
             <div className="border-t border-gray-200 mt-2 pt-4 space-y-1">
@@ -1564,23 +1648,57 @@ export default function Cashier() {
                               </button>
                               {order.status !== 'voided' && (
                                 <>
-                                  <button onClick={() => { setSelectedOrder(order); setShowVoidModal(true); setVoidReason(''); }}
+                                  <button onClick={() => {
+                                    setSelectedOrder(order);
+                                    setVoidReason('');
+                                    if (user?.role === 'admin') {
+                                      setShowVoidModal(true);
+                                    } else {
+                                      setPendingVoidAction('void-all');
+                                      setSupervisorUserId('');
+                                      setSupervisorPassword('');
+                                      setSupervisorError('');
+                                      setShowSupervisorAuth(true);
+                                    }
+                                  }}
                                     className="p-2 text-gray-400 hover:text-red-500 hover:bg-red-50 rounded-lg transition-colors"
                                     title="Void Semua">
                                     <span className="material-symbols-outlined text-[18px]">block</span>
                                   </button>
-                                  <button onClick={() => openVoidItemModal(order)}
+                                  <button onClick={() => {
+                                    if (user?.role === 'admin') {
+                                      openVoidItemModal(order);
+                                    } else {
+                                      setSelectedOrder(order);
+                                      setPendingVoidAction('void-item');
+                                      setSupervisorUserId('');
+                                      setSupervisorPassword('');
+                                      setSupervisorError('');
+                                      setShowSupervisorAuth(true);
+                                    }
+                                  }}
                                     className="p-2 text-gray-400 hover:text-amber-500 hover:bg-amber-50 rounded-lg transition-colors"
                                     title="Void Per Item">
                                     <span className="material-symbols-outlined text-[18px]">indeterminate_check_box</span>
                                   </button>
                                 </>
                               )}
-                              {order.status === 'voided' && (
-                                <button onClick={() => reopenOrder(order._id)}
-                                  className="p-2 text-gray-400 hover:text-green-600 hover:bg-green-50 rounded-lg transition-colors"
-                                  title="Buka Ulang">
-                                  <span className="material-symbols-outlined text-[18px]">replay</span>
+                              {order.status === 'completed' && (
+                                <button onClick={() => {
+                                  setSelectedOrder(order);
+                                  if (user?.role === 'admin') {
+                                    voidPaymentOrder();
+                                  } else {
+                                    setPendingVoidAction('void-payment');
+                                    setSupervisorUserId('');
+                                    setSupervisorPassword('');
+                                    setSupervisorError('');
+                                    setShowSupervisorAuth(true);
+                                  }
+                                }}
+                                  className="p-2 text-gray-400 hover:text-blue-500 hover:bg-blue-50 rounded-lg transition-colors"
+                                  title="Void Pembayaran">
+                                  <span className="material-symbols-outlined text-[18px]">payments</span>
                                 </button>
                               )}
                             </div>
@@ -1719,6 +1837,7 @@ export default function Cashier() {
                       <span className="flex-1">
                         {vi.productName || 'Unknown'} <span className="text-red-400">x{vi.qty}</span>
                         {vi.reason && <span className="text-gray-400 ml-1">- {vi.reason}</span>}
+                        {vi.voidedByName && <span className="text-gray-400 ml-1">({vi.voidedByName})</span>}
                       </span>
                       <span className="text-gray-400">
                         {new Date(vi.voidedAt).toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' })}
@@ -1728,9 +1847,10 @@ export default function Cashier() {
                 </div>
               )}
 
-              {selectedOrder.voidReason && (
-                <div className="border-t border-gray-100 pt-3">
-                  <span className="text-xs text-red-500">Alasan Void: {selectedOrder.voidReason}</span>
+              {(selectedOrder.status === 'voided' || selectedOrder.status === 'partially-voided') && (selectedOrder.voidedByName || selectedOrder.voidReason) && (
+                <div className="border-t border-gray-100 pt-3 text-xs text-red-500 space-y-0.5">
+                  {selectedOrder.voidedByName && <p>Dibatal oleh: {selectedOrder.voidedByName}</p>}
+                  {selectedOrder.voidReason && <p>Alasan: {selectedOrder.voidReason}</p>}
                 </div>
               )}
             </div>
@@ -1742,6 +1862,47 @@ export default function Cashier() {
               <button onClick={() => { setShowOrderDetail(false); printOrder(selectedOrder); }}
                 className="flex-1 py-3 bg-[#2176D2] text-white font-bold rounded-xl hover:opacity-90 transition-colors">
                 Print Ulang
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Supervisor Auth Modal */}
+      {showSupervisorAuth && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+          <div className="bg-white rounded-xl shadow-xl max-w-sm w-full mx-4 p-6">
+            <div className="flex items-center gap-3 mb-4">
+              <span className="material-symbols-outlined text-amber-600 text-[28px]">verified_user</span>
+              <h3 className="text-lg font-bold text-gray-800">Otorisasi Supervisor</h3>
+            </div>
+            <p className="text-sm text-gray-500 mb-4">
+              Kamu tidak memiliki izin void. Masukkan akun supervisor yang memiliki izin void.
+            </p>
+            <div className="space-y-3 mb-4">
+              <div>
+                <label className="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-2 block">User ID</label>
+                <input type="text" placeholder="user_id supervisor" value={supervisorUserId}
+                  onChange={(e) => setSupervisorUserId(e.target.value)}
+                  className="w-full px-3 py-2 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-amber-500/20" />
+              </div>
+              <div>
+                <label className="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-2 block">Password</label>
+                <input type="password" placeholder="password" value={supervisorPassword}
+                  onChange={(e) => setSupervisorPassword(e.target.value)}
+                  onKeyDown={(e) => e.key === 'Enter' && verifySupervisor()}
+                  className="w-full px-3 py-2 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-amber-500/20" />
+              </div>
+              {supervisorError && <p className="text-sm text-red-500">{supervisorError}</p>}
+            </div>
+            <div className="flex gap-3">
+              <button onClick={() => { setShowSupervisorAuth(false); setSupervisorData(null); setPendingVoidAction(null); }}
+                className="flex-1 py-3 bg-gray-200 text-gray-700 font-bold rounded-xl hover:bg-gray-300 transition-colors">
+                Batal
+              </button>
+              <button onClick={verifySupervisor}
+                className="flex-1 py-3 bg-amber-600 text-white font-bold rounded-xl hover:bg-amber-700 transition-colors">
+                Verifikasi
               </button>
             </div>
           </div>

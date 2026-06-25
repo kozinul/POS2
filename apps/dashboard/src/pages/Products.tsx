@@ -147,7 +147,7 @@ export default function Products() {
       taxes: product.taxes?.filter((t) => t.tax).map((t) => ({ id: t.tax._id, included: t.included })) || [],
       active: product.active,
       discount: String(product.discount),
-      category: typeof product.category === 'object' ? product.category._id : product.category,
+      category: product.category ? (typeof product.category === 'object' ? product.category._id : product.category) : '',
       outlets: product.outlets?.map((o) => o._id) || [],
       modifiers: product.modifiers?.map((m) => m._id) || [],
     });
