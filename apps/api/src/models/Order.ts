@@ -156,6 +156,5 @@ const orderSchema = new Schema<IOrderDoc>(
 );
 
 orderSchema.index({ createdAt: -1 });
-orderSchema.index({ orderNumber: 1 });
 
 export const Order = mongoose.model<IOrderDoc>('Order', orderSchema);

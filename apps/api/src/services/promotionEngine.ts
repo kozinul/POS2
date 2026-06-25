@@ -174,6 +174,8 @@ const evaluators: Record<string, RuleEvaluator> = {
   buy_x_pay_y: (rule, ctx) => {
     const c = rule.conditions;
     let items = ctx.cart.items;
+    if (c.scope === 'product' && c.targetIds?.length) items = items.filter((i) => c.targetIds!.includes(i.product._id));
+    if (c.scope === 'category' && c.targetIds?.length) items = items.filter((i) => c.targetIds!.includes(getProductCategoryId(i.product)));
     const totalQty = items.reduce((s, i) => s + i.qty, 0);
     const buyQty = c.buyQty || 1;
     const payQty = c.payQty || 1;

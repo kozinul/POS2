@@ -273,6 +273,7 @@ export default function Cashier() {
       if (p.endDate && now > new Date(p.endDate)) return sum;
       const limit = p.usageLimit?.perPromotion || 0;
       if (limit > 0 && p.usedCount >= limit) return sum;
+      if (p.minCartValue > 0 && subtotal < p.minCartValue) return sum;
       return sum + p.rules.reduce((s: number, rule: any) => {
         const c = rule.conditions;
         if (rule.type === 'percentage') {
@@ -304,16 +305,56 @@ export default function Cashier() {
         if (rule.type === 'min_quantity' && totalQty >= (c.minQty || 0)) {
           return s + Math.round(subtotal * (c.value || 0) / 100);
         }
+        if (rule.type === 'buy_x_get_y') {
+          const buyQty = c.buyQty || 1;
+          const freeQty = c.freeQty || 1;
+          let buyItems = cart;
+          if (c.scope === 'product' && c.targetIds?.length) buyItems = cart.filter((i) => c.targetIds.includes(i.product._id));
+          if (c.scope === 'category' && c.targetIds?.length) buyItems = cart.filter((i) => {
+            const catId = typeof i.product.category === 'object' ? (i.product.category as any)._id : i.product.category;
+            return c.targetIds.includes(catId);
+          });
+          const totalBought = buyItems.reduce((a, i) => a + i.qty, 0);
+          if (totalBought < buyQty) return s;
+          const times = Math.floor(totalBought / buyQty);
+          const totalFree = times * freeQty;
+          if (c.giftProductId) {
+            const inCart = cart.find((i) => i.product._id === c.giftProductId);
+            const freePrice = inCart ? inCart.product.price : 0;
+            return s + freePrice * Math.min(totalFree, (inCart?.qty || 0));
+          }
+          const cheapest = cart.length > 0 ? cart.reduce((a, b) => a.product.price < b.product.price ? a : b) : null;
+          return s + (cheapest ? cheapest.product.price * Math.min(totalFree, cheapest.qty) : 0);
+        }
+        if (rule.type === 'buy_x_pay_y') {
+          const buyQty = c.buyQty || 1;
+          const payQty = c.payQty || 1;
+          let buyItems = cart;
+          if (c.scope === 'product' && c.targetIds?.length) buyItems = cart.filter((i) => c.targetIds.includes(i.product._id));
+          if (c.scope === 'category' && c.targetIds?.length) buyItems = cart.filter((i) => {
+            const catId = typeof i.product.category === 'object' ? (i.product.category as any)._id : i.product.category;
+            return c.targetIds.includes(catId);
+          });
+          const qty = buyItems.reduce((a, i) => a + i.qty, 0);
+          if (qty < buyQty) return s;
+          const totalPrice = buyItems.reduce((a, i) => a + i.product.price * i.qty, 0);
+          return s + totalPrice - Math.round(totalPrice * payQty / buyQty);
+        }
+        // Fallback for unhandled types: estimate based on subtotal
+        if (c.value && subtotal > 0) return s + Math.round(subtotal * Number(c.value) / 100);
+        if (c.minAmount && subtotal >= c.minAmount) return s + Math.round(subtotal * 10 / 100);
         return s;
       }, 0);
     }, 0);
   }
 
-  const eligiblePromos = promoApplied
-    ? [promoApplied]
-    : activePromos.filter((p: any) => !p.requiresCode);
+  const autoPromos = activePromos.filter((p: any) => !p.requiresCode);
+  const eligiblePromos = [
+    ...autoPromos,
+    ...(promoApplied && !autoPromos.some((p: any) => p._id === promoApplied._id) ? [promoApplied] : []),
+  ];
   const estimatedDiscount = estimatePromoDiscount(eligiblePromos);
-  const promoPct = eligiblePromos.length > 0
+  const promoPct = eligiblePromos.length > 0 && subtotal > 0
     ? Math.round(estimatedDiscount / subtotal * 100)
     : 0;
   const dpp = Math.max(0, subtotal - estimatedDiscount);
@@ -359,6 +400,12 @@ export default function Cashier() {
         return;
       }
       const promo = await res.json();
+      const est = estimatePromoDiscount([promo]);
+      if (est <= 0) {
+        setPromoError('Promo belum memenuhi syarat');
+        setPromoApplied(null);
+        return;
+      }
       setPromoApplied(promo);
       setPromoError('');
     } catch {
@@ -1335,7 +1382,13 @@ export default function Cashier() {
 
             {/* Footer Total + Actions */}
             <div className="p-6 border-t border-gray-100 shrink-0 space-y-4">
-              {estimatedDiscount > 0 && (
+              {promoApplied && (
+                <div className="flex justify-between text-sm text-green-600 font-semibold">
+                  <span>Promo: {promoApplied.name}</span>
+                  <span>- Rp {estimatedDiscount.toLocaleString()}</span>
+                </div>
+              )}
+              {!promoApplied && estimatedDiscount > 0 && (
                 <div className="flex justify-between text-sm text-green-600 font-semibold">
                   <span>Diskon Promo {promoPct > 0 && `(${promoPct}%)`}</span>
                   <span>- Rp {estimatedDiscount.toLocaleString()}</span>
@@ -1596,6 +1649,11 @@ export default function Cashier() {
                               <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full uppercase ${statusColor}`}>
                                 {statusLabel}
                               </span>
+                              {(order.status === 'voided' || order.status === 'partially-voided') && order.voidedByName && (
+                                <span className="text-[10px] text-red-500 ml-1">
+                                  oleh {order.voidedByName}
+                                </span>
+                              )}
                             </div>
                             <div className="flex flex-wrap gap-x-4 gap-y-1 text-sm text-gray-500">
                               <span className="flex items-center gap-1">
