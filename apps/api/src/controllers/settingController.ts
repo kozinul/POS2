@@ -5,6 +5,11 @@ const defaultSettings = {
   currency: 'IDR',
   companyName: 'POS Indonesia',
   paymentMethods: ['cash', 'qris', 'debit'],
+  roundingConfig: {
+    enabled: true,
+    method: 'nearest_100',
+    maxRoundingAdjustment: 1000,
+  },
 };
 
 export async function getSettings(_req: Request, res: Response) {

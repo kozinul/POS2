@@ -214,6 +214,9 @@ export async function getCashierReport(req: AuthRequest, res: Response) {
     let totalSales = 0;
     let cashSales = 0;
     let nonCashSales = 0;
+    let totalRoundingAdjustment = 0;
+    let roundingCount = 0;
+    const taxTotals: Record<string, { name: string; code: string; amount: number }> = {};
     const breakdownMap = new Map<string, { method: string; code: string; total: number; count: number }>();
 
     for (const order of orders) {
@@ -226,6 +229,23 @@ export async function getCashierReport(req: AuthRequest, res: Response) {
         cashSales += order.total;
       } else {
         nonCashSales += order.total;
+      }
+
+      // Tax breakdown
+      if (order.taxDetails) {
+        for (const td of order.taxDetails as any[]) {
+          const key = td.taxCode || td.name;
+          if (!taxTotals[key]) {
+            taxTotals[key] = { name: td.name || key, code: td.taxCode || key, amount: 0 };
+          }
+          taxTotals[key].amount += td.amountRounded ?? td.amount ?? 0;
+        }
+      }
+
+      // Rounding
+      if (order.roundingAdjustment && order.roundingAdjustment !== 0) {
+        totalRoundingAdjustment += order.roundingAdjustment;
+        roundingCount++;
       }
 
       const existing = breakdownMap.get(code);
@@ -258,7 +278,10 @@ export async function getCashierReport(req: AuthRequest, res: Response) {
         nonCash: nonCashSales,
         voided: voidedTotal,
         transactionCount: orders.length,
+        roundingAdjustment: totalRoundingAdjustment,
+        roundingCount,
       },
+      taxBreakdown: Object.values(taxTotals),
       paymentBreakdown: [...breakdownMap.values()],
       cashDrawer: {
         startingCash: closing.startingCash,

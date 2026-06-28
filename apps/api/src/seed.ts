@@ -3,6 +3,7 @@ import mongoose from 'mongoose';
 import { User } from './models/User';
 import { Family } from './models/Family';
 import { Tax } from './models/Tax';
+import { TaxRule } from './models/TaxRule';
 import { PaymentMethod } from './models/PaymentMethod';
 import { Category } from './models/Category';
 import { Product } from './models/Product';
@@ -51,13 +52,106 @@ async function seed() {
   );
   console.log('Families created: Makanan, Minuman, Merchandise');
 
-  // Create default tax
+  // Create PPN 12% with DPP Nilai Lain (11/12) sesuai PMK terbaru
+  // PPN = 12% × (11/12 × Harga Jual) → efektif ~11%
   const ppn = await Tax.findOneAndUpdate(
-    { name: 'PPN 10%' },
-    { $setOnInsert: { name: 'PPN 10%', rate: 10, description: 'Pajak Pertambahan Nilai 10%', active: true } },
+    { code: 'PPN' },
+    {
+      $setOnInsert: {
+        name: 'PPN 12%',
+        code: 'PPN',
+        rate: 12,
+        rateType: 'percentage',
+        taxType: 'vat',
+        description: 'Pajak Pertambahan Nilai 12% dengan DPP Nilai Lain (11/12). Efektif: 11%',
+        dppFormula: { type: 'fraction', fraction: { numerator: 11, denominator: 12 } },
+        rounding: 'math',
+        roundingPrecision: 0,
+        scope: 'all',
+        includedByDefault: true,
+        priority: 0,
+        active: true,
+        exemptUpTo: 0,
+      },
+    },
     { upsert: true, new: true }
   );
-  console.log('Default tax created: PPN 10%');
+  console.log(`Tax created: ${ppn.name} (${ppn.rate}%, DPP 11/12, efektif ${(ppn.rate * 11 / 12).toFixed(2)}%)`);
+
+  // Create Service Charge tax (optional, for multiple tax per item)
+  const serviceCharge = await Tax.findOneAndUpdate(
+    { code: 'SC' },
+    {
+      $setOnInsert: {
+        name: 'Service Charge 5%',
+        code: 'SC',
+        rate: 5,
+        rateType: 'percentage',
+        taxType: 'service_charge',
+        description: 'Biaya pelayanan 5%',
+        dppFormula: { type: 'full' },
+        rounding: 'math',
+        roundingPrecision: 0,
+        scope: 'all',
+        includedByDefault: false,
+        priority: 1,
+        active: true,
+        exemptUpTo: 0,
+      },
+    },
+    { upsert: true, new: true }
+  );
+  console.log(`Tax created: ${serviceCharge.name}`);
+
+  // Create Tax-Free example (untuk barang bebas pajak)
+  const taxFree = await Tax.findOneAndUpdate(
+    { code: 'TAX-FREE' },
+    {
+      $setOnInsert: {
+        name: 'Bebas Pajak',
+        code: 'TAX-FREE',
+        rate: 0,
+        rateType: 'percentage',
+        taxType: 'vat',
+        description: 'Barang/jasa bebas pajak (0%)',
+        dppFormula: { type: 'full' },
+        rounding: 'math',
+        roundingPrecision: 0,
+        scope: 'product',
+        includedByDefault: false,
+        priority: 0,
+        active: true,
+        exemptUpTo: 0,
+      },
+    },
+    { upsert: true, new: true }
+  );
+  console.log(`Tax created: ${taxFree.name}`);
+
+  // Create TaxRule for PPN regulation (future-ready)
+  await TaxRule.findOneAndUpdate(
+    { name: 'PPN 12% - DPP Nilai Lain (11/12)' },
+    {
+      $setOnInsert: {
+        name: 'PPN 12% - DPP Nilai Lain (11/12)',
+        description: 'PMK tentang PPN 12% dengan DPP Nilai Lain 11/12',
+        taxCode: 'PPN',
+        regulationReference: 'PMK-131/2024',
+        conditions: {
+          applicableFrom: new Date('2025-01-01'),
+          minTransactionValue: 0,
+        },
+        actions: {
+          rateOverride: 12,
+          dppFractionOverride: { numerator: 11, denominator: 12 },
+        },
+        priority: 100,
+        active: true,
+      },
+    },
+    { upsert: true, new: true }
+  );
+  console.log('TaxRule created: PPN 12% with DPP Nilai Lain');
 
   // Create default payment methods
   const defaultPaymentMethods = [
@@ -82,7 +176,7 @@ async function seed() {
     { $setOnInsert: { name: 'Makanan Berat', description: 'Nasi, mie, ayam', family: foodFamily._id } },
     { upsert: true, new: true }
   );
-  await Category.findOneAndUpdate(
+  const snackCat = await Category.findOneAndUpdate(
     { name: 'Camilan' },
     { $setOnInsert: { name: 'Camilan', description: 'Snack ringan', family: foodFamily._id } },
     { upsert: true, new: true }
@@ -99,7 +193,7 @@ async function seed() {
   );
   console.log('Categories created');
 
-  // Create sample products
+  // Create sample products - all use PPN 12% with DPP Nilai Lain (included in price)
   const products = [
     { name: 'Nasi Goreng', price: 15000, costPrice: 10000, stock: 50, taxes: [{ tax: ppn._id, included: true }], discount: 0, stockManagement: true, category: foodCat._id },
     { name: 'Mie Goreng', price: 12000, costPrice: 8000, stock: 50, taxes: [{ tax: ppn._id, included: true }], discount: 0, stockManagement: true, category: foodCat._id },

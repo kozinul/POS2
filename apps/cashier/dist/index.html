@@ -1,12 +1,59 @@
 <!DOCTYPE html>
 <html lang="id">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>POS - Kasir</title>
-    <script type="module" crossorigin src="/assets/index-DOSgSlPz.js"></script>
-  </head>
-  <body>
-    <div id="root"></div>
-  </body>
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<title>POS System - Kasir</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&display=swap" rel="stylesheet" crossorigin />
+<style>
+    body {
+      font-family: 'Inter', system-ui, -apple-system, sans-serif;
+      background-color: #F3F4F6;
+    }
+    .status-pill {
+      background-color: #E6F4EA;
+      color: #1E7E34;
+    }
+    .blue-primary {
+      background-color: #2176D2;
+    }
+    .text-blue-primary {
+      color: #2176D2;
+    }
+    .bg-light-grey {
+      background-color: #F8F9FA;
+    }
+    .product-card {
+      transition: transform 0.1s ease;
+    }
+    .product-card:active {
+      transform: scale(0.98);
+    }
+    .order-list-container::-webkit-scrollbar {
+      width: 4px;
+    }
+    .order-list-container::-webkit-scrollbar-track {
+      background: #f1f1f1;
+    }
+    .order-list-container::-webkit-scrollbar-thumb {
+      background: #ccc;
+      border-radius: 10px;
+    }
+    @media print {
+      body * { visibility: hidden; }
+      #receipt-print, #receipt-print * { visibility: visible; }
+      #receipt-print { position: fixed; top: 0; left: 0; width: 100%; }
+      #report-print, #report-print * { visibility: visible; }
+      #report-print { position: fixed; top: 0; left: 0; width: 100%; max-width: 600px; margin: 0 auto; padding: 20px; }
+    }
+  </style>
+  <script type="module" crossorigin src="/assets/index-BwkgBnAA.js"></script>
+</head>
+<body>
+<div id="root"></div>
+</body>
 </html>

@@ -2,42 +2,57 @@ import { Response } from 'express';
 import { AuthRequest } from '../middleware/auth';
 import { Order } from '../models/Order';
 import { Product } from '../models/Product';
-import { Tax } from '../models/Tax';
 import { PaymentMethod } from '../models/PaymentMethod';
 import { Member } from '../models/Member';
 import { Promotion } from '../models/Promotion';
 import { User } from '../models/User';
 import { Closing } from '../models/Closing';
 import { calculateCartPromotions, CartItem } from '../services/promotionEngine';
+import { calculateTaxes, TaxLineItem } from '../services/taxEngine';
+import { calculatePayment, calculateSplitPayment, loadRoundingConfig, InvoiceTotals, PaymentAllocation } from '../services/paymentEngine';
 
 export async function createOrder(req: AuthRequest, res: Response) {
   try {
-    const { items, paymentMethod, cashAmount, cardLastFour, promoCode, memberId, tableNumber, customerName, outlet: outletId } = req.body;
+    const { items, paymentMethod, paymentMethods, cashAmount, cardLastFour, promoCode, memberId, tableNumber, customerName, outlet: outletId, transactionType, status, splitGroup, splitIndex, closeOpenBillId } = req.body;
+    const isOpen = status === 'open';
 
-    const pm = await PaymentMethod.findById(paymentMethod);
-    if (!pm) return res.status(400).json({ message: 'Payment method not found' });
+    const isSplitPayment = !isOpen && Array.isArray(paymentMethods) && paymentMethods.length > 0;
 
-    // Validate outlet
+    // ─── Open bill: skip payment validation ──────────────────────────────
+    if (!isOpen && !isSplitPayment && !paymentMethod) {
+      return res.status(400).json({ message: 'Payment method required' });
+    }
+
+    if (!isOpen) {
+      if (isSplitPayment) {
+        for (const pmAlloc of paymentMethods) {
+          const pm = await PaymentMethod.findById(pmAlloc.paymentMethodId);
+          if (!pm) return res.status(400).json({ message: `Payment method ${pmAlloc.paymentMethodId} not found` });
+        }
+      } else {
+        const pm = await PaymentMethod.findById(paymentMethod);
+        if (!pm) return res.status(400).json({ message: 'Payment method not found' });
+      }
+    }
+    await loadRoundingConfig();
+
     const cashierUser = await User.findById(req.user!.id).populate('outlets', 'name');
     if (!cashierUser) return res.status(404).json({ message: 'User not found' });
 
     const userOutlets = cashierUser.outlets as any as { _id: string; name: string }[];
     let outletName = '';
     if (req.user!.role === 'admin') {
-      // Admin can set any outlet
       if (outletId) {
         const outlet = userOutlets.find((o) => String(o._id) === outletId);
         outletName = outlet?.name || '';
       }
     } else {
-      // Cashier must pick from their assigned outlets
       if (!outletId) return res.status(400).json({ message: 'Outlet harus dipilih' });
       const outlet = userOutlets.find((o) => String(o._id) === outletId);
       if (!outlet) return res.status(403).json({ message: 'Anda tidak memiliki akses ke outlet ini' });
       outletName = outlet.name;
     }
 
-    // Cek shift aktif untuk cashier
     if (req.user!.role === 'cashier') {
       const activeShift = await Closing.findOne({
         cashier: req.user!.id,
@@ -52,10 +67,7 @@ export async function createOrder(req: AuthRequest, res: Response) {
     let subtotal = 0;
     const orderItems = [];
     const cartItems: CartItem[] = [];
-
-    // Fetch all active taxes
-    const activeTaxes = await Tax.find({ active: true });
-
+    const taxLineItems: TaxLineItem[] = [];
     const orderProducts: any[] = [];
 
     for (const item of items) {
@@ -69,6 +81,7 @@ export async function createOrder(req: AuthRequest, res: Response) {
       const effectivePrice = product.price + modTotal;
       const lineTotal = effectivePrice * item.qty;
       subtotal += lineTotal;
+
       orderItems.push({
         product: product._id,
         qty: item.qty,
@@ -76,6 +89,7 @@ export async function createOrder(req: AuthRequest, res: Response) {
         subtotal: lineTotal,
         modifiers: item.modifiers || [],
       });
+
       const cat = product.category as any;
       cartItems.push({
         product: {
@@ -86,12 +100,32 @@ export async function createOrder(req: AuthRequest, res: Response) {
         },
         qty: item.qty,
       });
+
+      const productTaxes = (product as any).taxes || [];
+      const taxOverrides = productTaxes
+        .filter((pt: any) => pt.tax && pt.included !== undefined)
+        .map((pt: any) => ({
+          taxId: String(pt.tax._id || pt.tax),
+          included: pt.included,
+        }));
+
+      taxLineItems.push({
+        productId: String(product._id),
+        productName: product.name,
+        qty: item.qty,
+        unitPrice: effectivePrice,
+        modifiersTotal: modTotal,
+        lineTotal,
+        categoryId: cat?._id ? String(cat._id) : undefined,
+        categoryName: cat?.name || undefined,
+        productTaxOverrides: taxOverrides.length > 0 ? taxOverrides : undefined,
+      });
+
       orderProducts.push(product);
     }
 
     const cashierName = cashierUser.name;
 
-    // Look up member if provided (before promo calc, for member-based promos)
     let customerCtx: { id: string; name: string; tier?: string; totalOrders?: number; totalSpend?: number } | undefined;
     let memberData: any = null;
     if (memberId) {
@@ -107,7 +141,6 @@ export async function createOrder(req: AuthRequest, res: Response) {
       }
     }
 
-    // Calculate promotions first to determine DPP
     let totalDiscount = 0;
     let totalFreeItems: { productId: string; qty: number }[] = [];
     let promoBreakdown: { name: string; code: string; discount: number; freeItems?: { productId: string; qty: number }[] }[] = [];
@@ -127,30 +160,19 @@ export async function createOrder(req: AuthRequest, res: Response) {
 
     const dpp = Math.max(0, subtotal - totalDiscount);
 
-    // Per-item tax: calculated on DPP (discounted subtotal)
-    let taxTotal = 0;
-    const taxDetails = activeTaxes.map((t) => {
-      let amount = 0;
-      let included = false;
-      for (const item of items) {
-        const p = orderProducts.find((x) => String(x._id) === item.product);
-        if (!p) continue;
-        const pt = (p.taxes || []).find((x: any) => x.tax && String(x.tax._id) === String(t._id));
-        const itemTotal = p.price * item.qty;
-        const itemDpp = Math.max(0, itemTotal - Math.round(totalDiscount * itemTotal / subtotal));
-        if (pt && pt.included) {
-          included = true;
-          amount += Math.round(itemDpp * t.rate / (100 + t.rate));
-        } else {
-          const tax = Math.round(itemDpp * t.rate / 100);
-          amount += tax;
-          taxTotal += tax;
-        }
-      }
-      return { name: t.name, rate: t.rate, amount, included };
+    // Tax calculation using TaxEngine
+    const taxResult = await calculateTaxes({
+      items: taxLineItems,
+      subtotal,
+      discountTotal: totalDiscount,
+      transactionType: transactionType || undefined,
+      outletId: outletId || undefined,
+      customerTier: customerCtx?.tier,
+      date: new Date(),
     });
 
-    // Apply promotion modifications (e.g., special_price)
+    const { taxTotalExcluded, taxDetails, grandTotal } = taxResult;
+
     for (const cartItem of cartItems) {
       const mod = totalFreeItems.find((f) => f.productId === cartItem.product._id);
       if (mod) {
@@ -163,40 +185,258 @@ export async function createOrder(req: AuthRequest, res: Response) {
       }
     }
 
-    const totalAfterDiscount = dpp + taxTotal;
+    // ─── Open bill: skip payment engine ──────────────────────────────────────
+    if (isOpen) {
+      const now = new Date();
+      const dateStr = now.toISOString().slice(0, 10).replace(/-/g, '');
+      const todayCount = await Order.countDocuments({
+        createdAt: {
+          $gte: new Date(now.getFullYear(), now.getMonth(), now.getDate()),
+          $lt: new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1),
+        },
+      });
+      let orderNumber = `INV-${dateStr}-${String(todayCount + 1).padStart(4, '0')}`;
+      if (splitGroup && splitIndex) {
+        orderNumber = `${orderNumber}/${splitIndex}`;
+      }
 
-    let change: number | undefined;
-    if (pm.type === 'cash' && cashAmount) {
-      change = cashAmount - totalAfterDiscount;
-      if (change < 0) return res.status(400).json({ message: 'Insufficient cash amount' });
+      const serializedTaxDetails = taxDetails.map(td => ({
+        taxId: td.taxId,
+        taxCode: td.taxCode,
+        name: td.taxName,
+        rate: td.rate,
+        effectiveRate: td.effectiveRate,
+        dppType: td.dppType,
+        dppFraction: td.dppFraction,
+        dppAmount: td.dppAmount,
+        taxableAmount: td.taxableAmount,
+        amount: td.taxAmount,
+        amountRounded: td.taxAmountRounded,
+        included: td.included,
+        taxExcludedRounded: td.taxExcludedRounded,
+        taxIncludedRounded: td.taxIncludedRounded,
+        rounding: td.rounding,
+        roundingPrecision: td.roundingPrecision,
+        perItem: td.perItem.map(pi => ({
+          productId: pi.productId,
+          productName: pi.productName,
+          dpp: pi.dpp,
+          taxAmount: pi.taxAmount,
+          included: pi.included,
+        })),
+      }));
+
+      const order = await Order.create({
+        orderNumber,
+        items: orderItems,
+        cashier: req.user!.id,
+        cashierName,
+        outlet: outletId,
+        outletName,
+        member: memberData?._id,
+        memberName: memberData?.name,
+        memberTier: memberData?.tier,
+        tableNumber: tableNumber || undefined,
+        customerName: customerName || undefined,
+        transactionType: transactionType || undefined,
+        subtotal,
+        discountTotal: totalDiscount,
+        dppTotal: dpp,
+        taxTotal: taxTotalExcluded,
+        taxDetails: serializedTaxDetails,
+        promotions: promoBreakdown,
+        total: grandTotal,
+        originalTotal: grandTotal,
+        roundedPayable: grandTotal,
+        roundingAdjustment: 0,
+        roundingMethod: 'no_rounding',
+        status: 'open',
+      });
+
+      return res.status(201).json(order);
     }
 
-    // Generate order number
+    // ─── Payment Engine ──────────────────────────────────────────────────────
+    const invoiceTotals: InvoiceTotals = {
+      subtotal,
+      discountTotal: totalDiscount,
+      serviceCharge: 0,
+      serviceChargeRate: 0,
+      taxTotalExcluded,
+      taxTotalIncluded: 0,
+      grandTotal,
+    };
+
+    let originalTotal: number;
+    let roundedPayable: number;
+    let roundingAdjustment: number;
+    let roundingMethod: string;
+    let cashReceived: number;
+    let change: number;
+    let paymentBreakdown: any[];
+    let primaryPaymentMethodId: any;
+    let primaryPaymentMethodCode: string;
+    let primaryPaymentMethodName: string;
+
+    if (isSplitPayment) {
+      const pmDocs = await PaymentMethod.find({ _id: { $in: paymentMethods.map((p: any) => p.paymentMethodId) } });
+      const pmMap = new Map(pmDocs.map((p) => [String(p._id), p]));
+
+      const allocations: PaymentAllocation[] = paymentMethods.map((p: any) => {
+        const pm = pmMap.get(p.paymentMethodId)!;
+        return {
+          paymentMethodId: p.paymentMethodId,
+          paymentMethodCode: pm.code,
+          paymentMethodName: pm.name,
+          type: pm.type,
+          amount: Number(p.amount),
+          cardLastFour: pm.requiresCardLastFour ? p.cardLastFour : undefined,
+        };
+      });
+
+      const splitResult = calculateSplitPayment(invoiceTotals, allocations);
+      if (splitResult.isUnderpayment) {
+        return res.status(400).json({
+          message: `Pembayaran kurang Rp ${splitResult.shortfall.toLocaleString()}`,
+          shortfall: splitResult.shortfall,
+          roundedPayable: splitResult.roundedPayable,
+        });
+      }
+
+      originalTotal = splitResult.originalTotal;
+      roundedPayable = splitResult.roundedPayable;
+      roundingAdjustment = splitResult.roundingAdjustment;
+      roundingMethod = splitResult.roundingMethod;
+      cashReceived = splitResult.cashReceived;
+      change = splitResult.change;
+      paymentBreakdown = splitResult.paymentBreakdown;
+      primaryPaymentMethodId = paymentMethods[0].paymentMethodId;
+      primaryPaymentMethodCode = allocations[0].paymentMethodCode;
+      primaryPaymentMethodName = allocations[0].paymentMethodName;
+    } else {
+      const pm = await PaymentMethod.findById(paymentMethod);
+      if (!pm) return res.status(400).json({ message: 'Payment method not found' });
+
+      const paymentResult = calculatePayment({
+        invoice: invoiceTotals,
+        paymentMethodId: String(pm._id),
+        paymentMethodCode: pm.code,
+        paymentMethodName: pm.name,
+        cashAmount: pm.type === 'cash' ? (cashAmount ? Number(cashAmount) : undefined) : undefined,
+        cardLastFour,
+      });
+
+      if (paymentResult.isUnderpayment) {
+        return res.status(400).json({
+          message: `Pembayaran kurang Rp ${paymentResult.shortfall.toLocaleString()}`,
+          shortfall: paymentResult.shortfall,
+          roundedPayable: paymentResult.roundedPayable,
+        });
+      }
+
+      originalTotal = paymentResult.originalTotal;
+      roundedPayable = paymentResult.roundedPayable;
+      roundingAdjustment = paymentResult.roundingAdjustment;
+      roundingMethod = paymentResult.roundingMethod;
+      cashReceived = paymentResult.cashReceived;
+      change = paymentResult.change;
+      paymentBreakdown = paymentResult.paymentBreakdown;
+      primaryPaymentMethodId = pm._id;
+      primaryPaymentMethodCode = pm.code;
+      primaryPaymentMethodName = pm.name;
+    }
+
+    // ─── Generate order number ──────────────────────────────────────────────
     const now = new Date();
     const dateStr = now.toISOString().slice(0, 10).replace(/-/g, '');
-    const todayCount = await Order.countDocuments({
-      createdAt: {
-        $gte: new Date(now.getFullYear(), now.getMonth(), now.getDate()),
-        $lt: new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1),
-      },
-    });
-    const orderNumber = `INV-${dateStr}-${String(todayCount + 1).padStart(4, '0')}`;
+    let orderNumber: string;
+
+    if (splitGroup && splitIndex) {
+      const firstInGroup = await Order.findOne({ splitGroup }).sort({ createdAt: 1 }).select('orderNumber');
+      if (firstInGroup && firstInGroup.orderNumber) {
+        const base = firstInGroup.orderNumber.replace(/\/\d+$/, '');
+        orderNumber = `${base}/${splitIndex}`;
+      } else {
+        const todayCount = await Order.countDocuments({
+          createdAt: {
+            $gte: new Date(now.getFullYear(), now.getMonth(), now.getDate()),
+            $lt: new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1),
+          },
+        });
+        orderNumber = `INV-${dateStr}-${String(todayCount + 1).padStart(4, '0')}/${splitIndex}`;
+      }
+    } else {
+      const todayCount = await Order.countDocuments({
+        createdAt: {
+          $gte: new Date(now.getFullYear(), now.getMonth(), now.getDate()),
+          $lt: new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1),
+        },
+      });
+      orderNumber = `INV-${dateStr}-${String(todayCount + 1).padStart(4, '0')}`;
+    }
+
+    const serializedTaxDetails = taxDetails.map(td => ({
+      taxId: td.taxId,
+      taxCode: td.taxCode,
+      name: td.taxName,
+      rate: td.rate,
+      effectiveRate: td.effectiveRate,
+      dppType: td.dppType,
+      dppFraction: td.dppFraction,
+      dppAmount: td.dppAmount,
+      taxableAmount: td.taxableAmount,
+      amount: td.taxAmount,
+      amountRounded: td.taxAmountRounded,
+      included: td.included,
+      taxExcludedRounded: td.taxExcludedRounded,
+      taxIncludedRounded: td.taxIncludedRounded,
+      rounding: td.rounding,
+      roundingPrecision: td.roundingPrecision,
+      perItem: td.perItem.map(pi => ({
+        productId: pi.productId,
+        productName: pi.productName,
+        dpp: pi.dpp,
+        taxAmount: pi.taxAmount,
+        included: pi.included,
+      })),
+    }));
+
+    const serializedPaymentBreakdown = paymentBreakdown.map(pb => ({
+      paymentMethodId: pb.paymentMethodId,
+      paymentMethodCode: pb.paymentMethodCode,
+      paymentMethodName: pb.paymentMethodName,
+      amount: pb.amount,
+      roundedAmount: pb.roundedAmount,
+      type: pb.type,
+    }));
+
+    // Determine if there's any cash in the split for cashAmount/change fields
+    const hasCashPayment = paymentBreakdown.some((pb: any) => pb.type === 'cash');
+    const firstCardEntry = isSplitPayment
+      ? paymentMethods.find((p: any) => p.cardLastFour)
+      : null;
 
     const order = await Order.create({
       orderNumber,
       items: orderItems,
-      total: totalAfterDiscount,
+      total: roundedPayable,
+      originalTotal,
+      roundedPayable,
+      roundingAdjustment,
+      roundingMethod,
       subtotal,
-      taxTotal,
-      taxDetails,
+      dppTotal: dpp,
+      taxTotal: taxTotalExcluded,
+      taxDetails: serializedTaxDetails,
       discountTotal: totalDiscount,
       promotions: promoBreakdown,
-      paymentMethod: pm._id,
-      paymentMethodCode: pm.code,
-      paymentMethodName: pm.name,
-      cashAmount: pm.type === 'cash' ? cashAmount : undefined,
-      change,
-      cardLastFour: pm.requiresCardLastFour ? cardLastFour : undefined,
+      paymentMethod: primaryPaymentMethodId,
+      paymentMethodCode: primaryPaymentMethodCode,
+      paymentMethodName: primaryPaymentMethodName,
+      paymentBreakdown: serializedPaymentBreakdown,
+      cashAmount: hasCashPayment ? cashReceived : undefined,
+      change: hasCashPayment ? change : undefined,
+      cardLastFour: firstCardEntry?.cardLastFour || cardLastFour,
       cashier: req.user!.id,
       cashierName,
       outlet: outletId || undefined,
@@ -206,16 +446,17 @@ export async function createOrder(req: AuthRequest, res: Response) {
       memberTier: memberData?.tier,
       tableNumber: tableNumber || undefined,
       customerName: customerName || undefined,
+      transactionType: transactionType || undefined,
+      splitGroup: splitGroup || undefined,
+      splitIndex: splitIndex || undefined,
     });
 
-    // Update member stats
     if (memberData) {
       await Member.findByIdAndUpdate(memberData._id, {
-        $inc: { totalOrders: 1, totalSpend: totalAfterDiscount },
+        $inc: { totalOrders: 1, totalSpend: originalTotal },
       });
     }
 
-    // Increment promo usage count
     if (promoBreakdown.length > 0) {
       for (const p of promoBreakdown) {
         await Promotion.findOneAndUpdate({ code: p.code }, { $inc: { usedCount: 1 } });
@@ -231,6 +472,10 @@ export async function createOrder(req: AuthRequest, res: Response) {
       }
     }
 
+    if (closeOpenBillId) {
+      await Order.findByIdAndUpdate(closeOpenBillId, { status: 'completed' });
+    }
+
     const populated = await order.populate(['items.product', 'paymentMethod', 'cashier', 'member']);
     res.status(201).json(populated);
   } catch (err: any) {
@@ -240,8 +485,10 @@ export async function createOrder(req: AuthRequest, res: Response) {
 
 export async function getOrders(req: AuthRequest, res: Response) {
   try {
-    const { startDate, endDate, outlet, cashier, search, page = '1', limit = '20' } = req.query;
+    const { startDate, endDate, outlet, cashier, search, status, page = '1', limit = '20' } = req.query;
     const filter: any = {};
+
+    if (status) filter.status = status;
 
     if (startDate || endDate) {
       filter.createdAt = {};
@@ -271,7 +518,6 @@ export async function getOrders(req: AuthRequest, res: Response) {
         { 'items.product': { $in: [] as string[] } },
       ];
 
-      // Also search by product names
       if (s.length >= 2) {
         const products = await Product.find({ name: { $regex: s, $options: 'i' } }).select('_id');
         const productIds = products.map((p) => String(p._id));
@@ -312,6 +558,90 @@ export async function getOrder(req: AuthRequest, res: Response) {
   }
 }
 
+export async function closeOpenBill(req: AuthRequest, res: Response) {
+  try {
+    const order = await Order.findById(req.params.id);
+    if (!order) return res.status(404).json({ message: 'Order not found' });
+    if (order.status !== 'open') return res.status(400).json({ message: 'Order is not an open bill' });
+
+    order.status = 'completed';
+    await order.save();
+
+    res.json({ message: 'Open bill closed', order });
+  } catch (err: any) {
+    res.status(500).json({ message: err.message });
+  }
+}
+
+export async function payOpenBill(req: AuthRequest, res: Response) {
+  try {
+    const { paymentMethod, cashAmount, cardLastFour } = req.body;
+    const order = await Order.findById(req.params.id);
+    if (!order) return res.status(404).json({ message: 'Order not found' });
+    if (order.status !== 'open') return res.status(400).json({ message: 'Order is not an open bill' });
+    if (!paymentMethod) return res.status(400).json({ message: 'Payment method required' });
+
+    const pm = await PaymentMethod.findById(paymentMethod);
+    if (!pm) return res.status(400).json({ message: 'Payment method not found' });
+
+    await loadRoundingConfig();
+
+    const invoiceTotals: InvoiceTotals = {
+      subtotal: order.subtotal || 0,
+      discountTotal: order.discountTotal || 0,
+      serviceCharge: order.serviceCharge || 0,
+      serviceChargeRate: order.serviceChargeRate || 0,
+      taxTotalExcluded: order.taxTotal || 0,
+      taxTotalIncluded: 0,
+      grandTotal: order.total || 0,
+    };
+
+    const paymentResult = calculatePayment({
+      invoice: invoiceTotals,
+      paymentMethodId: String(pm._id),
+      paymentMethodCode: pm.code,
+      paymentMethodName: pm.name,
+      cashAmount: pm.type === 'cash' ? (cashAmount ? Number(cashAmount) : undefined) : undefined,
+      cardLastFour,
+    });
+
+    if (paymentResult.isUnderpayment) {
+      return res.status(400).json({
+        message: `Pembayaran kurang Rp ${paymentResult.shortfall.toLocaleString()}`,
+        shortfall: paymentResult.shortfall,
+        roundedPayable: paymentResult.roundedPayable,
+      });
+    }
+
+    const serializedPaymentBreakdown = paymentResult.paymentBreakdown.map((pb: any) => ({
+      paymentMethodId: pb.paymentMethodId,
+      paymentMethodCode: pb.paymentMethodCode,
+      paymentMethodName: pb.paymentMethodName,
+      amount: pb.amount,
+      roundedAmount: pb.roundedAmount,
+      type: pb.type,
+    }));
+
+    order.paymentMethod = pm._id;
+    order.paymentMethodCode = pm.code;
+    order.paymentMethodName = pm.name;
+    order.cashAmount = paymentResult.cashReceived || undefined;
+    order.change = paymentResult.change || undefined;
+    order.cardLastFour = cardLastFour || undefined;
+    order.roundedPayable = paymentResult.roundedPayable;
+    order.roundingAdjustment = paymentResult.roundingAdjustment;
+    order.roundingMethod = paymentResult.roundingMethod;
+    order.paymentBreakdown = serializedPaymentBreakdown as any;
+    order.status = 'completed';
+
+    await order.save();
+    const populated = await Order.findById(order._id).populate(['items.product', 'paymentMethod', 'cashier']);
+    res.json(populated);
+  } catch (err: any) {
+    res.status(500).json({ message: err.message });
+  }
+}
+
 export async function getDailyReport(_req: AuthRequest, res: Response) {
   try {
     const today = new Date();
@@ -339,7 +669,6 @@ export async function voidOrder(req: AuthRequest, res: Response) {
     if (!order) return res.status(404).json({ message: 'Order not found' });
     if (order.status === 'voided') return res.status(400).json({ message: 'Order sudah di-void' });
 
-    // Restore stock for each item (skip already-voided items)
     for (const item of order.items) {
       const alreadyVoidedQty = (order.voidedItems || [])
         .filter((vi) => String(vi.itemId) === String((item as any)._id))
@@ -385,7 +714,6 @@ export async function voidItem(req: AuthRequest, res: Response) {
     const voidQty = qty || orderItem.qty;
     if (voidQty <= 0) return res.status(400).json({ message: 'Qty void harus lebih dari 0' });
 
-    // Check how many of this item are already voided
     const alreadyVoided = order.voidedItems
       ?.filter((vi) => String(vi.itemId) === itemId)
       ?.reduce((s, vi) => s + vi.qty, 0) || 0;
@@ -411,7 +739,6 @@ export async function voidItem(req: AuthRequest, res: Response) {
 
     order.voidedItems = [...(order.voidedItems || []), voidedEntry as any];
 
-    // Determine new status
     const allFullyVoided = order.items.every((item) => {
       const voided = order.voidedItems
         ?.filter((vi) => String(vi.itemId) === String(item._id))
@@ -420,7 +747,6 @@ export async function voidItem(req: AuthRequest, res: Response) {
     });
     order.status = allFullyVoided ? 'voided' : 'partially-voided';
 
-    // Also set order-level void info when fully voided
     if (allFullyVoided) {
       order.voidedAt = new Date();
       order.voidedBy = voidedById as any;
@@ -430,7 +756,6 @@ export async function voidItem(req: AuthRequest, res: Response) {
 
     await order.save();
 
-    // Restore stock
     if (orderItem.price > 0) {
       const prod = await Product.findById(orderItem.product._id).select('stockManagement');
       if (prod && prod.stockManagement) {
@@ -454,7 +779,6 @@ export async function voidPayment(req: AuthRequest, res: Response) {
 
     const voidedById = supervisorId || req.user!.id;
 
-    // Restore stock
     for (const item of order.items) {
       const alreadyVoidedQty = (order.voidedItems || [])
         .filter((vi) => String(vi.itemId) === String((item as any)._id))
@@ -468,7 +792,6 @@ export async function voidPayment(req: AuthRequest, res: Response) {
       }
     }
 
-    // Build voided items for all non-voided items
     const voidedEntries = order.items
       .filter((item) => {
         const alreadyVoided = (order.voidedItems || [])

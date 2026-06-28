@@ -86,7 +86,6 @@ export default function Cashier() {
       });
     });
   }
-  const [paymentMethod, setPaymentMethod] = useState<string>('');
   const [selectedMember, setSelectedMember] = useState<any>(null);
   const [memberSearch, setMemberSearch] = useState('');
   const [memberResults, setMemberResults] = useState<any[]>([]);
@@ -96,6 +95,7 @@ export default function Cashier() {
   const [promoError, setPromoError] = useState('');
   const [cashAmount, setCashAmount] = useState('');
   const [cardLastFour, setCardLastFour] = useState('');
+  const [paymentSteps, setPaymentSteps] = useState<{ methodId: string; amount: string; cardLastFour: string }[]>([]);
   const [tableNumber, setTableNumber] = useState('');
   const [customerName, setCustomerName] = useState('');
   const [showReceipt, setShowReceipt] = useState(false);
@@ -144,17 +144,87 @@ export default function Cashier() {
   const [pickupAmount, setPickupAmount] = useState('');
   const [pickupReason, setPickupReason] = useState('');
 
+  // Payment rounding
+  const [roundingInfo, setRoundingInfo] = useState<{
+    originalTotal: number;
+    roundingAdjustment: number;
+    roundingMethod: string;
+    roundedPayable: number;
+  } | null>(null);
+  const [roundingConfig, setRoundingConfig] = useState<{ enabled: boolean; method: string; maxRoundingAdjustment: number } | null>(null);
+
+  // Split Bill
+  const [showSplitBill, setShowSplitBill] = useState(false);
+  const [splitPersons, setSplitPersons] = useState<{ id: string; name: string; itemQty: { [cartId: string]: number }; paymentMethodId?: string; cashAmount?: string; cardLastFour?: string; paid?: boolean }[]>([]);
+  const [activeSplitPersonId, setActiveSplitPersonId] = useState<string | null>(null);
+  const [savedSplitCart, setSavedSplitCart] = useState<any[] | null>(null);
+  const [splitHasMore, setSplitHasMore] = useState(false);
+  const [splitGroupId, setSplitGroupId] = useState('');
+
+  // Open Bills
+  const [showOpenBills, setShowOpenBills] = useState(false);
+  const [openBills, setOpenBills] = useState<any[]>([]);
+  const [loadingOpenBills, setLoadingOpenBills] = useState(false);
+  const [showCloseShiftWarning, setShowCloseShiftWarning] = useState(false);
+  const [loadedOpenBillId, setLoadedOpenBillId] = useState<string | null>(null);
+
   // Modifier selection
   const [showModifierModal, setShowModifierModal] = useState(false);
   const [modifierProduct, setModifierProduct] = useState<Product | null>(null);
   const [modifierSelections, setModifierSelections] = useState<{ [modifierId: string]: ModifierOption }>({});
 
   useEffect(() => {
+    fetch('/api/settings')
+      .then((r) => r.json())
+      .then((data) => setRoundingConfig(data.roundingConfig || null));
+  }, []);
+
+  async function fetchOpenBills() {
+    const token = localStorage.getItem('token');
+    try {
+      const res = await fetch('/api/orders?status=open', {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setOpenBills(data.orders || []);
+      }
+    } catch {}
+  }
+
+  useEffect(() => {
+    fetchOpenBills();
+  }, []);
+
+  function previewRounding(amount: number, method: string): { rawRounded: number; adjustment: number; finalPayable: number } {
+    let rawRounded: number;
+    switch (method) {
+      case 'nearest_100': rawRounded = Math.round(amount / 100) * 100; break;
+      case 'nearest_500': rawRounded = Math.round(amount / 500) * 500; break;
+      case 'nearest_1000': rawRounded = Math.round(amount / 1000) * 1000; break;
+      case 'round_up_100': rawRounded = Math.ceil(amount / 100) * 100; break;
+      case 'round_down_100': rawRounded = Math.floor(amount / 100) * 100; break;
+      default: rawRounded = amount; break;
+    }
+    let adjustment = rawRounded - amount;
+    if (roundingConfig && Math.abs(adjustment) > roundingConfig.maxRoundingAdjustment) {
+      adjustment = 0;
+    }
+    return { rawRounded, adjustment, finalPayable: amount + adjustment };
+  }
+
+  function getRoundedAmount(amount: number, methodType?: string): number {
+    if (methodType === 'cash' && roundingConfig?.enabled) {
+      return previewRounding(amount, roundingConfig.method).finalPayable;
+    }
+    return amount;
+  }
+
+  useEffect(() => {
     fetch('/api/families').then((r) => r.json()).then(setFamilies);
     fetch('/api/categories?active=true').then((r) => r.json()).then(setCategories);
     fetch('/api/payment-methods').then((r) => r.json()).then((methods) => {
       setPaymentMethods(methods);
-      if (methods.length > 0) setPaymentMethod(methods[0]._id);
     });
     fetch('/api/taxes?active=true').then((r) => r.json()).then(setActiveTaxes);
     fetch('/api/promotions').then((r) => r.json()).then(setActivePromos);
@@ -242,24 +312,34 @@ export default function Cashier() {
     return sum + (item.product.price + modTotal) * item.qty;
   }, 0);
 
+  function calcTaxOnPrice(price: number, rate: number, included: boolean, dppFraction?: number): number {
+    if (included && dppFraction != null && dppFraction !== 1) {
+      // Price includes tax: extract tax amount
+      const effRate = dppFraction * rate / 100;
+      return Math.round(price * effRate / (1 + effRate));
+    }
+    const dpp = dppFraction != null ? Math.round(price * dppFraction) : price;
+    if (included) return Math.round(dpp * rate / (100 + rate));
+    return Math.round(dpp * rate / 100);
+  }
+
   // Per-item tax: only add taxes that are NOT already included in each product price
-  const taxDetails = activeTaxes.map((t) => {
+  const taxDetails = activeTaxes.map((t: any) => {
     let displayAmount = 0;
     let addAmount = 0;
+    const dppFraction = t.dppFormula?.type === 'fraction' && t.dppFormula?.fraction
+      ? t.dppFormula.fraction.numerator / t.dppFormula.fraction.denominator
+      : undefined;
     for (const item of cart) {
       const match = (item.product.taxes || []).find(
         (pt) => String(pt.tax._id) === String(t._id)
       );
       const itemTotal = (item.product.price + (item.modifiers || []).reduce((s, m) => s + m.price, 0)) * item.qty;
-      if (match && match.included) {
-        displayAmount += Math.round(itemTotal * t.rate / (100 + t.rate));
-      } else {
-        const tax = Math.round(itemTotal * t.rate / 100);
-        displayAmount += tax;
-        addAmount += tax;
-      }
+      const tax = calcTaxOnPrice(itemTotal, t.rate, match?.included ?? false, dppFraction);
+      displayAmount += tax;
+      if (!match?.included) addAmount += tax;
     }
-    return { ...t, amount: displayAmount, addAmount };
+    return { ...t, amount: displayAmount, addAmount, dppFraction };
   });
   const taxTotal = taxDetails.reduce((s, t) => s + t.addAmount, 0);
 
@@ -360,30 +440,68 @@ export default function Cashier() {
   const dpp = Math.max(0, subtotal - estimatedDiscount);
 
   // Recalculate excluded taxes on DPP (harga setelah diskon)
-  const dppTaxDetails = activeTaxes.map((t) => {
+  const dppTaxDetails = activeTaxes.map((t: any) => {
     let displayAmount = 0;
     let addAmount = 0;
+    const dppFraction = t.dppFormula?.type === 'fraction' && t.dppFormula?.fraction
+      ? t.dppFormula.fraction.numerator / t.dppFormula.fraction.denominator
+      : undefined;
     for (const item of cart) {
       const match = (item.product.taxes || []).find(
         (pt) => String(pt.tax._id) === String(t._id)
       );
+      const itemIncluded = match ? match.included : t.includedByDefault;
       const itemTotal = (item.product.price + (item.modifiers || []).reduce((s, m) => s + m.price, 0)) * item.qty;
       const itemDpp = Math.max(0, itemTotal - Math.round(estimatedDiscount * itemTotal / subtotal));
-      if (match && match.included) {
-        displayAmount += Math.round(itemDpp * t.rate / (100 + t.rate));
-      } else {
-        const tax = Math.round(itemDpp * t.rate / 100);
+      if (itemIncluded && dppFraction != null && dppFraction !== 1) {
+        const effRate = dppFraction * t.rate / 100;
+        const tax = Math.round(itemDpp * effRate / (1 + effRate));
         displayAmount += tax;
-        addAmount += tax;
+      } else {
+        const effectiveDpp = dppFraction != null ? Math.round(itemDpp * dppFraction) : itemDpp;
+        if (itemIncluded) {
+          const tax = Math.round(effectiveDpp * t.rate / (100 + t.rate));
+          displayAmount += tax;
+        } else {
+          const tax = Math.round(effectiveDpp * t.rate / 100);
+          displayAmount += tax;
+          addAmount += tax;
+        }
       }
     }
-    return { ...t, amount: displayAmount, addAmount };
+    return { ...t, amount: displayAmount, addAmount, dppFraction };
   });
   const dppTaxTotal = dppTaxDetails.reduce((s, t) => s + t.addAmount, 0);
   const grandTotal = dpp + dppTaxTotal;
-  const selectedPM = paymentMethods.find((pm) => pm._id === paymentMethod);
-  const isCash = selectedPM?.type === 'cash';
-  const change = isCash && cashAmount ? Number(cashAmount) - grandTotal : 0;
+  // Split payment: pick methods one by one until total is covered
+  const totalAllocated = paymentSteps.reduce((s, st) => s + (Number(st.amount) || 0), 0);
+  const targetTotal = roundingInfo?.roundedPayable ?? grandTotal;
+  const remainingAmount = Math.max(0, targetTotal - totalAllocated);
+  const hasCashMethod = paymentSteps.some((st) => paymentMethods.find((pm) => pm._id === st.methodId)?.type === 'cash');
+  const isFullyCovered = remainingAmount === 0 && paymentSteps.length > 0 && paymentSteps.every((st) => Number(st.amount) > 0);
+
+  // Compute rounding: single cash step (amount may already be rounded from getRoundedAmount)
+  const isSingleCash = hasCashMethod && paymentSteps.length === 1;
+
+  useEffect(() => {
+    if (!isSingleCash || !roundingConfig?.enabled) {
+      setRoundingInfo(null);
+      return;
+    }
+    const cashAmount = Number(paymentSteps[0].amount) || grandTotal;
+    const result = previewRounding(cashAmount, roundingConfig.method);
+    setRoundingInfo({
+      originalTotal: grandTotal,
+      roundingAdjustment: result.adjustment,
+      roundingMethod: roundingConfig.method,
+      roundedPayable: result.finalPayable,
+    });
+  }, [paymentSteps, isSingleCash, roundingConfig, grandTotal]);
+
+  const effectivePayable = roundingInfo?.roundedPayable ?? grandTotal;
+  const isPaymentComplete = isSingleCash
+    ? Number(paymentSteps[0].amount) >= effectivePayable
+    : isFullyCovered && totalAllocated >= effectivePayable;
 
   async function applyPromoCode() {
     setPromoError('');
@@ -440,6 +558,30 @@ export default function Cashier() {
     if (cart.length === 0) return;
 
     const token = localStorage.getItem('token');
+
+    const paymentPayload = paymentSteps.length === 1
+      ? {
+          paymentMethod: paymentSteps[0].methodId,
+          cashAmount: paymentMethods.find((pm) => pm._id === paymentSteps[0].methodId)?.type === 'cash'
+            ? (Number(paymentSteps[0].amount) || undefined)
+            : undefined,
+          cardLastFour: paymentSteps[0].cardLastFour || undefined,
+        }
+      : {
+          paymentMethods: paymentSteps.map((st) => ({
+            paymentMethodId: st.methodId,
+            amount: Number(st.amount),
+            cardLastFour: st.cardLastFour || undefined,
+          })),
+        };
+
+    // Split bill tracking
+    let splitIdx: number | undefined;
+    if (activeSplitPersonId) {
+      const paidCount = splitPersons.filter((p) => p.paid).length;
+      splitIdx = paidCount + 1;
+    }
+
     const res = await fetch('/api/orders', {
       method: 'POST',
       headers: {
@@ -453,26 +595,47 @@ export default function Cashier() {
           price: item.product.price,
           modifiers: item.modifiers || [],
         })),
-        paymentMethod: selectedPM?._id,
-        cashAmount: isCash ? Number(cashAmount) : undefined,
-        cardLastFour: selectedPM?.requiresCardLastFour ? cardLastFour : undefined,
+        ...paymentPayload,
         promoCode: promoApplied?.code || undefined,
         memberId: selectedMember?._id || undefined,
         tableNumber: tableNumber || undefined,
         customerName: customerName || undefined,
         outlet: selectedOutlet?._id || undefined,
+        splitGroup: activeSplitPersonId ? splitGroupId || undefined : undefined,
+        splitIndex: splitIdx,
+        closeOpenBillId: loadedOpenBillId,
       }),
     });
 
     if (res.ok) {
       const order = await res.json();
+
+      // If split payment, mark this person as paid
+      if (activeSplitPersonId) {
+        setSplitPersons((prev) => prev.map((p) =>
+          p.id === activeSplitPersonId ? { ...p, paid: true } : p
+        ));
+        const remaining = splitPersons.filter((p) => p.id !== activeSplitPersonId && !p.paid && Object.values(p.itemQty).some((q) => q > 0));
+        setSplitHasMore(remaining.length > 0);
+        if (remaining.length === 0) {
+          setActiveSplitPersonId(null);
+          setSavedSplitCart(null);
+        }
+      }
+
       setLastOrder(order);
+      setShowPaymentModal(false);
+      setPaymentSteps([]);
       setShowReceipt(true);
       setCart([]);
       setCashAmount('');
       setPromoCode('');
       setPromoApplied(null);
       setSelectedMember(null);
+      setTableNumber('');
+      setCustomerName('');
+      setLoadedOpenBillId(null);
+      fetchOpenBills();
     }
   }
 
@@ -776,8 +939,11 @@ export default function Cashier() {
       {/* Header */}
       <header className="bg-[#2176D2] text-white h-16 flex items-center justify-between px-6 shrink-0 shadow-md z-10">
         <div className="flex items-center gap-4">
-          <button onClick={() => setShowSidebar(true)} className="flex items-center gap-2 hover:bg-white/10 px-3 py-1.5 rounded-lg transition-colors">
+          <button onClick={() => setShowSidebar(true)} className="flex items-center gap-2 hover:bg-white/10 px-3 py-1.5 rounded-lg transition-colors relative">
             <span className="material-symbols-outlined text-[24px]">menu</span>
+            {openBills.length > 0 && (
+              <span className="absolute -top-0.5 -left-0.5 w-5 h-5 bg-red-500 text-white text-[10px] font-bold rounded-full flex items-center justify-center shadow">{openBills.length}</span>
+            )}
             <span className="text-lg font-semibold">{user?.name || 'Kasir'}</span>
           </button>
           {user?.outlets && user.outlets.length > 0 && (
@@ -803,7 +969,25 @@ export default function Cashier() {
         <div className="flex items-center gap-4">
           {shift && (
             <button
-              onClick={() => { setPhysicalCash(''); setShowCloseShift(true); }}
+              onClick={async () => {
+                const token = localStorage.getItem('token');
+                try {
+                  const res = await fetch('/api/orders?status=open', {
+                    headers: { Authorization: `Bearer ${token}` },
+                  });
+                  if (res.ok) {
+                    const data = await res.json();
+                    const bills = data.orders || [];
+                    setOpenBills(bills);
+                    if (bills.length > 0) {
+                      setShowCloseShiftWarning(true);
+                      return;
+                    }
+                  }
+                } catch {}
+                setPhysicalCash('');
+                setShowCloseShift(true);
+              }}
               className="px-4 py-1.5 bg-amber-500/20 text-amber-200 border border-amber-400/30 rounded-lg text-sm font-semibold hover:bg-amber-500/30 transition-colors"
             >
               Tutup Shift
@@ -967,6 +1151,9 @@ export default function Cashier() {
                       {product.taxes?.length > 0 && product.taxes.some((t) => t.included) && (
                         <span className="text-[10px] text-amber-700 bg-amber-100 ml-1.5 px-1.5 py-0.5 rounded font-semibold align-middle">Inc</span>
                       )}
+                      {product.taxes?.length > 0 && product.taxes.some((t: any) => (t as any).dppType === 'fraction') && (
+                        <span className="text-[10px] text-blue-600 bg-blue-100 ml-1 px-1.5 py-0.5 rounded font-semibold align-middle">DPP 11/12</span>
+                      )}
                     </p>
                     <div className="mt-auto pt-4 flex items-center justify-between">
                       <span className={`text-xs ${outOfStock ? 'text-red-500 font-medium' : 'text-gray-500'}`}>
@@ -1021,58 +1208,57 @@ export default function Cashier() {
               <input type="text" placeholder="No. Meja" value={tableNumber}
                 onChange={(e) => setTableNumber(e.target.value)}
                 className="w-24 px-3 py-1.5 border border-gray-200 rounded-lg text-sm focus:ring-blue-500 focus:border-blue-500" />
-              <input type="text" placeholder="Nama Pelanggan (opsional)" value={customerName}
+              <input type="text" placeholder="Nama Pelanggan" value={customerName}
                 onChange={(e) => setCustomerName(e.target.value)}
                 className="flex-1 px-3 py-1.5 border border-gray-200 rounded-lg text-sm focus:ring-blue-500 focus:border-blue-500" />
             </div>
           </div>
 
           {/* Order Items List */}
-          <div className="flex-1 overflow-y-auto order-list-container p-6 space-y-6">
+          <div className="flex-1 overflow-y-auto order-list-container p-6 space-y-3">
             {cart.map((item) => {
               const modTotal = (item.modifiers || []).reduce((s, m) => s + m.price, 0);
+              const mods = item.modifiers || [];
               return (
-              <div key={cartId(item)}>
+              <div key={cartId(item)} className="pb-3 border-b border-gray-100 last:border-b-0">
                 <div className="flex justify-between items-start">
-                  <div className="flex-1">
-                    <h4 className="font-bold text-gray-800">{item.product.name} x{item.qty}</h4>
-                    <p className="text-sm text-gray-400">Rp {(item.product.price + modTotal).toLocaleString()}</p>
-                    {item.modifiers && item.modifiers.length > 0 && (
-                      <div className="mt-1 text-xs text-gray-400 space-y-0.5">
-                        {item.modifiers.map((m, i) => (
-                          <div key={i} className="flex justify-between pl-3">
+                  <div className="flex-1 min-w-0">
+                    <h4 className="font-bold text-gray-800 text-sm truncate">{item.product.name} <span className="text-gray-400 font-normal">x{item.qty}</span></h4>
+                    {mods.length > 0 && (
+                      <div className="mt-0.5 text-xs text-gray-400 space-y-0.5">
+                        {mods.map((m, i) => (
+                          <div key={i} className="flex justify-between pl-2">
                             <span>+ {m.name}</span>
-                            <span>Rp {m.price.toLocaleString()}</span>
+                            {m.price > 0 && <span>Rp {m.price.toLocaleString()}</span>}
                           </div>
                         ))}
                       </div>
                     )}
                   </div>
-                  <div className="flex items-center gap-4">
-                    <span className="font-medium text-gray-800">
+                  <div className="flex items-center gap-2 shrink-0 ml-3">
+                    <span className="font-semibold text-gray-800 text-sm whitespace-nowrap">
                       Rp {((item.product.price + modTotal) * item.qty).toLocaleString()}
                     </span>
-                    <div className="flex gap-2">
+                    <div className="flex gap-1">
                       <button
                         onClick={() => updateQty(cartId(item), 1)}
                         disabled={item.product.stockManagement && item.qty >= item.product.stock}
                         className="text-gray-300 hover:text-[#2176D2] disabled:opacity-30"
                       >
-                        <span className="material-symbols-outlined text-[20px]">add_circle</span>
+                        <span className="material-symbols-outlined text-[18px]">add_circle</span>
                       </button>
                       <button
                         onClick={() => updateQty(cartId(item), -1)}
                         className="text-gray-300 hover:text-[#2176D2]"
                       >
-                        <span className="material-symbols-outlined text-[20px]">remove_circle</span>
+                        <span className="material-symbols-outlined text-[18px]">remove_circle</span>
                       </button>
                       <button onClick={() => removeItem(cartId(item))} className="text-gray-300 hover:text-red-500">
-                        <span className="material-symbols-outlined text-[20px]">delete</span>
+                        <span className="material-symbols-outlined text-[18px]">delete</span>
                       </button>
                     </div>
                   </div>
                 </div>
-                <div className="border-t border-gray-100 mt-4"></div>
               </div>
             )})}
             {cart.length === 0 && (
@@ -1084,45 +1270,108 @@ export default function Cashier() {
           </div>
 
           {/* Order Totals */}
-          <div className="p-6 bg-white border-t border-gray-100 shrink-0 space-y-3">
-            <div className="flex justify-between text-gray-500 text-sm">
+          <div className="p-5 bg-white border-t border-gray-100 shrink-0 space-y-2 text-sm">
+            <div className="flex justify-between text-gray-500">
               <span>Subtotal</span>
               <span>Rp {subtotal.toLocaleString()}</span>
             </div>
             {estimatedDiscount > 0 && (
-              <>
-                <div className="flex justify-between text-green-600 text-sm font-semibold">
-                  <span>Diskon Promo {promoPct > 0 && `(${promoPct}%)`}</span>
-                  <span>- Rp {estimatedDiscount.toLocaleString()}</span>
-                </div>
-              </>
+              <div className="flex justify-between text-green-600 font-semibold">
+                <span>Diskon Promo {promoPct > 0 && `(${promoPct}%)`}</span>
+                <span>- Rp {estimatedDiscount.toLocaleString()}</span>
+              </div>
             )}
-            {dppTaxDetails.map((t, i) => {
+            {dppTaxDetails.map((t: any, i) => {
               const isIncluded = cart.some((item) =>
                 (item.product.taxes || []).some((pt) => String(pt.tax._id) === String(t._id) && pt.included)
               );
+              const dppLabel = t.dppFraction != null ? `DPP ${t.dppFraction.numerator || ''}/${t.dppFraction.denominator || ''}` : undefined;
               return (
-                <div key={i} className="flex justify-between text-sm">
+                <div key={i} className="flex justify-between">
                   <span className={isIncluded ? 'text-amber-700' : 'text-gray-500'}>
-                    {t.name}{t.rate > 0 && ` (${t.rate}%)`}
-                    {isIncluded && <span className="text-[10px] ml-1 font-semibold">[Inc]</span>}
+                    {t.name}
+                    {t.rate > 0 && <span className="font-mono"> ({t.rate}%)</span>}
+                    {dppLabel && <span className="text-[10px] ml-1 font-mono text-gray-400">{dppLabel}</span>}
+                    {isIncluded && <span className="text-[10px] ml-1.5 font-semibold text-amber-500">[Inc]</span>}
                   </span>
                   <span className={isIncluded ? 'text-amber-700' : 'text-gray-500'}>
-                    Rp {t.amount.toLocaleString()}
+                    {t.addAmount > 0 && '+'}Rp {t.amount.toLocaleString()}
                   </span>
                 </div>
               );
             })}
-            <div className="border-t border-gray-200 pt-3 flex justify-between items-center">
-              <span className="text-lg font-bold text-gray-800">Total</span>
-              <span className="text-2xl font-extrabold text-gray-900">Rp {grandTotal.toLocaleString()}</span>
+            <hr className="border-gray-200 my-1" />
+            <div className="flex justify-between items-center">
+              <span className="text-base font-bold text-gray-800">Total</span>
+              <span className="text-xl font-extrabold text-gray-900">Rp {grandTotal.toLocaleString()}</span>
             </div>
+
+            {/* Split Bill */}
+            {cart.length > 0 && cart.reduce((s, i) => s + i.qty, 0) > 1 && (
+              <button
+                onClick={() => {
+                  const firstCash = paymentMethods.find((pm) => pm.type === 'cash');
+                  setSplitGroupId(crypto.randomUUID());
+                  setSplitPersons(cart.map((item) => ({
+                    id: crypto.randomUUID(),
+                    name: '',
+                    itemQty: { [cartId(item)]: item.qty },
+                    paymentMethodId: firstCash?._id || paymentMethods[0]?._id,
+                  })));
+                  setShowSplitBill(true);
+                }}
+                className="w-full py-3 border-2 border-[#2176D2] text-[#2176D2] font-bold rounded-xl hover:bg-blue-50 transition-colors mb-2"
+              >
+                Split Bill
+              </button>
+            )}
+
+            {/* Simpan Pesanan (Open Bill) */}
+            {cart.length > 0 && (
+              <button
+                disabled={!tableNumber && !customerName}
+                onClick={async () => {
+                  const token = localStorage.getItem('token');
+                  const res = await fetch('/api/orders', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+                    body: JSON.stringify({
+                      items: cart.map((item) => ({
+                        product: item.product._id,
+                        qty: item.qty,
+                        price: item.product.price,
+                        modifiers: item.modifiers || [],
+                      })),
+                      status: 'open',
+                      promoCode: promoApplied?.code || undefined,
+                      memberId: selectedMember?._id || undefined,
+                      tableNumber: tableNumber || undefined,
+                      customerName: customerName || undefined,
+                      outlet: selectedOutlet?._id || undefined,
+                    }),
+                  });
+                  if (res.ok) {
+                    setCart([]);
+                    setPromoCode('');
+                    setPromoApplied(null);
+                    setSelectedMember(null);
+                    setTableNumber('');
+                    setCustomerName('');
+                    fetchOpenBills();
+                  }
+                }}
+                className="w-full py-3 border-2 border-amber-500 text-amber-600 font-bold rounded-xl hover:bg-amber-50 transition-colors mb-2 disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                <span className="material-symbols-outlined text-[18px] align-middle mr-1">save</span>
+                Simpan Pesanan
+              </button>
+            )}
 
             {/* Proses Pembayaran */}
             <button
               onClick={() => { setShowPaymentModal(true); }}
-              disabled={cart.length === 0}
-              className="w-full py-4 bg-[#2176D2] text-white font-bold rounded-xl hover:opacity-90 transition-opacity disabled:opacity-50 disabled:cursor-not-allowed mt-2"
+              disabled={cart.length === 0 || (!tableNumber && !customerName)}
+              className="w-full py-4 bg-[#2176D2] text-white font-bold rounded-xl hover:opacity-90 transition-opacity disabled:opacity-50 disabled:cursor-not-allowed"
             >
               Proses Pembayaran
             </button>
@@ -1158,6 +1407,28 @@ export default function Cashier() {
                 Buka Shift
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* Close Shift Warning Modal (open bills exist) */}
+      {showCloseShiftWarning && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+          <div className="bg-white rounded-xl shadow-xl max-w-sm w-full mx-4 p-6">
+            <div className="flex items-center gap-3 mb-4">
+              <span className="material-symbols-outlined text-red-500 text-[28px]">warning</span>
+              <h3 className="text-lg font-bold text-gray-800">Tidak Dapat Tutup Shift</h3>
+            </div>
+            <p className="text-sm text-gray-600 mb-4">
+              Masih ada <strong>{openBills.length} pesanan aktif</strong> yang belum dibayar.
+              Selesaikan semua pesanan aktif sebelum menutup shift.
+            </p>
+            <button
+              onClick={() => setShowCloseShiftWarning(false)}
+              className="w-full py-3 bg-[#2176D2] text-white font-bold rounded-xl hover:opacity-90 transition-opacity"
+            >
+              Mengerti
+            </button>
           </div>
         </div>
       )}
@@ -1250,164 +1521,590 @@ export default function Cashier() {
         </div>
       )}
 
-      {/* Payment Modal */}
-      {showPaymentModal && (
+      {/* Split Bill Modal */}
+      {showSplitBill && cart.length > 0 && (
         <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
-          <div className="bg-white rounded-xl shadow-xl max-w-lg w-full mx-4 max-h-[90vh] flex flex-col">
+          <div className="bg-white rounded-xl shadow-xl max-w-3xl w-full mx-4 max-h-[90vh] flex flex-col">
             <div className="p-6 border-b border-gray-100 flex justify-between items-center shrink-0">
-              <h3 className="text-lg font-bold text-gray-800">Pembayaran</h3>
-              <button onClick={() => setShowPaymentModal(false)} className="text-gray-400 hover:text-gray-600">
+              <div className="flex items-center gap-3">
+                <span className="material-symbols-outlined text-[#2176D2] text-[28px]">call_split</span>
+                <h3 className="text-lg font-bold text-gray-800">Split Bill</h3>
+              </div>
+              <button onClick={() => setShowSplitBill(false)} className="text-gray-400 hover:text-gray-600">
                 <span className="material-symbols-outlined text-[24px]">close</span>
               </button>
             </div>
 
-            <div className="flex-1 overflow-y-auto p-6 space-y-5">
-              {/* Member */}
-              <div>
-                <label className="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-2 block">Member</label>
-                {selectedMember ? (
-                  <div className="flex items-center justify-between bg-blue-50 rounded-lg px-4 py-3">
+            <div className="flex-1 overflow-y-auto p-6">
+              {/* Person headers */}
+              <div className="flex gap-3 mb-4 flex-wrap">
+                {splitPersons.map((person, pi) => {
+                  const personTotal = Object.entries(person.itemQty).reduce((sum, [cid, qty]) => {
+                    const item = cart.find((ci) => cartId(ci) === cid);
+                    if (!item) return sum;
+                    const modTotal = (item.modifiers || []).reduce((s, m) => s + m.price, 0);
+                    return sum + (item.product.price + modTotal) * qty;
+                  }, 0);
+                  const selPm = paymentMethods.find((pm) => pm._id === person.paymentMethodId);
+                  return (
+                  <div key={person.id} className="bg-blue-50 border border-blue-200 rounded-lg px-3 py-2 min-w-[200px]">
                     <div className="flex items-center gap-2">
-                      <span className="material-symbols-outlined text-[#2176D2] text-[18px]">diversity_3</span>
-                      <div>
-                        <span className="text-sm font-semibold text-gray-800">{selectedMember.name}</span>
-                        <span className={`ml-2 text-[10px] font-semibold px-1.5 py-0.5 rounded ${
-                          selectedMember.tier === 'platinum' ? 'bg-purple-100 text-purple-700' :
-                          selectedMember.tier === 'gold' ? 'bg-yellow-100 text-yellow-700' :
-                          selectedMember.tier === 'silver' ? 'bg-gray-100 text-gray-600' :
-                          'bg-gray-50 text-gray-500'
-                        }`}>
-                          {selectedMember.tier.charAt(0).toUpperCase() + selectedMember.tier.slice(1)}
-                        </span>
-                      </div>
+                      <span className="material-symbols-outlined text-[#2176D2] text-[18px]">person</span>
+                      <input
+                        type="text"
+                        placeholder={`Orang ${pi + 1}`}
+                        value={person.name}
+                        onChange={(e) => setSplitPersons((prev) => prev.map((p) => p.id === person.id ? { ...p, name: e.target.value } : p))}
+                        className="w-20 bg-transparent text-sm font-semibold focus:outline-none border-b border-dashed border-blue-300"
+                      />
+                      <span className="text-xs font-bold text-[#2176D2] bg-blue-100 px-2 py-0.5 rounded-full">
+                        Rp {personTotal.toLocaleString()}
+                      </span>
+                      {splitPersons.length > 1 && (
+                        <button onClick={() => {
+                          setSplitPersons((prev) => {
+                            const removed = prev.find((p) => p.id === person.id);
+                            const rest = prev.filter((p) => p.id !== person.id);
+                            if (!removed || rest.length === 0) return rest;
+                            const merged = { ...rest[0] };
+                            for (const [cid, qty] of Object.entries(removed.itemQty)) {
+                              merged.itemQty[cid] = (merged.itemQty[cid] || 0) + qty;
+                            }
+                            return [merged, ...rest.slice(1)];
+                          });
+                        }} className="text-gray-400 hover:text-red-500 ml-auto">
+                          <span className="material-symbols-outlined text-[16px]">close</span>
+                        </button>
+                      )}
                     </div>
-                    <button onClick={() => setSelectedMember(null)} className="text-gray-400 hover:text-red-500">
-                      <span className="material-symbols-outlined text-[18px]">close</span>
-                    </button>
+                    <div className="mt-1.5 flex items-center gap-1.5">
+                      <span className="material-symbols-outlined text-gray-400 text-[14px]">payments</span>
+                      <select
+                        value={person.paymentMethodId || ''}
+                        onChange={(e) => setSplitPersons((prev) => prev.map((p) => p.id === person.id ? { ...p, paymentMethodId: e.target.value } : p))}
+                        className="text-xs bg-white border border-blue-200 rounded px-1.5 py-1 focus:outline-none"
+                      >
+                        {paymentMethods.filter((pm) => pm.active).map((pm) => (
+                          <option key={pm._id} value={pm._id}>{pm.name}</option>
+                        ))}
+                      </select>
+                      {selPm?.type === 'cash' && (
+                        <input
+                          type="number"
+                          placeholder="Jumlah"
+                          value={person.cashAmount || ''}
+                          onChange={(e) => setSplitPersons((prev) => prev.map((p) => p.id === person.id ? { ...p, cashAmount: e.target.value } : p))}
+                          className="w-20 text-xs bg-white border border-blue-200 rounded px-1.5 py-1 focus:outline-none"
+                        />
+                      )}
+                      {selPm?.requiresCardLastFour && (
+                        <input
+                          type="text"
+                          placeholder="4 digit"
+                          maxLength={4}
+                          value={person.cardLastFour || ''}
+                          onChange={(e) => setSplitPersons((prev) => prev.map((p) => p.id === person.id ? { ...p, cardLastFour: e.target.value } : p))}
+                          className="w-16 text-xs bg-white border border-blue-200 rounded px-1.5 py-1 focus:outline-none"
+                        />
+                      )}
+                    </div>
                   </div>
-                ) : (
-                  <div className="relative">
-                    <div className="flex gap-2">
-                      <input type="text" placeholder="Cari Member (nama/telepon)" value={memberSearch}
-                        onChange={(e) => searchMember(e.target.value)}
-                        onFocus={() => setShowMemberSearch(true)}
-                        className="flex-1 px-3 py-2 border border-gray-200 rounded-lg text-sm focus:ring-blue-500 focus:border-blue-500" />
-                      <button onClick={() => setShowMemberSearch(!showMemberSearch)}
-                        className="px-3 py-2 text-sm font-semibold text-[#2176D2] bg-blue-50 rounded-lg hover:bg-blue-100">
-                        Cari
+                )})}
+                <button onClick={() => setSplitPersons((prev) => [...prev, {
+                  id: crypto.randomUUID(), name: '', itemQty: {},
+                  paymentMethodId: paymentMethods.find((pm) => pm.type === 'cash')?._id || paymentMethods[0]?._id,
+                }])}
+                  className="flex items-center gap-1 px-3 py-2 border-2 border-dashed border-gray-300 rounded-lg text-sm text-gray-500 hover:border-[#2176D2] hover:text-[#2176D2] transition-colors">
+                  <span className="material-symbols-outlined text-[16px]">add</span>
+                  Tambah Orang
+                </button>
+              </div>
+
+              {/* Items table */}
+              <table className="w-full text-left border-collapse">
+                <thead>
+                  <tr className="border-b border-gray-200">
+                    <th className="py-2 pr-4 text-xs font-semibold text-gray-500 uppercase">Item</th>
+                    <th className="py-2 px-2 text-xs font-semibold text-gray-500 uppercase text-center">Qty</th>
+                    {splitPersons.map((person, pi) => (
+                      <th key={person.id} className="py-2 px-2 text-xs font-semibold text-gray-500 uppercase text-center min-w-[80px]">
+                        {person.name || `Orang ${pi + 1}`}
+                      </th>
+                    ))}
+                    <th className="py-2 pl-2 text-xs font-semibold text-gray-500 uppercase text-right">Sisa</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {cart.map((item) => {
+                    const key = cartId(item);
+                    const totalQty = item.qty;
+                    const assigned = splitPersons.reduce((s, p) => s + (p.itemQty[key] || 0), 0);
+                    const remaining = totalQty - assigned;
+                    const modTotal = (item.modifiers || []).reduce((s, m) => s + m.price, 0);
+                    const unitPrice = item.product.price + modTotal;
+                    return (
+                      <tr key={key} className="border-b border-gray-100">
+                        <td className="py-3 pr-4">
+                          <div className="text-sm font-medium text-gray-800">{item.product.name}</div>
+                          <div className="text-xs text-gray-400">Rp {unitPrice.toLocaleString()}</div>
+                        </td>
+                        <td className="py-3 px-2 text-center text-sm font-semibold text-gray-600">{totalQty}</td>
+                        {splitPersons.map((person) => {
+                          const val = person.itemQty[key] || 0;
+                          return (
+                            <td key={person.id} className="py-3 px-2 text-center">
+                              <div className="flex items-center justify-center gap-1">
+                                <button
+                                  onClick={() => setSplitPersons((prev) => prev.map((p) => p.id === person.id ? { ...p, itemQty: { ...p.itemQty, [key]: Math.max(0, val - 1) } } : p))}
+                                  className="w-6 h-6 rounded-full bg-gray-100 text-gray-500 hover:bg-gray-200 flex items-center justify-center text-sm"
+                                >-</button>
+                                <span className="w-6 text-center text-sm font-bold text-[#2176D2]">{val}</span>
+                                <button
+                                  onClick={() => {
+                                    // Can only add if there's remaining quantity
+                                    const currentAssigned = splitPersons.reduce((s, p) => s + (p.itemQty[key] || 0), 0);
+                                    if (currentAssigned >= totalQty) return;
+                                    setSplitPersons((prev) => prev.map((p) => p.id === person.id ? { ...p, itemQty: { ...p.itemQty, [key]: val + 1 } } : p));
+                                  }}
+                                  className="w-6 h-6 rounded-full bg-gray-100 text-gray-500 hover:bg-gray-200 flex items-center justify-center text-sm"
+                                >+</button>
+                              </div>
+                            </td>
+                          );
+                        })}
+                        <td className={`py-3 pl-2 text-right text-sm font-bold ${remaining !== 0 ? 'text-amber-600' : 'text-green-600'}`}>
+                          {remaining}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+
+              {/* Person totals */}
+              <div className="mt-6 grid grid-cols-2 md:grid-cols-3 gap-4">
+                {splitPersons.map((person, pi) => {
+                  const total = Object.entries(person.itemQty).reduce((sum, [cid, qty]) => {
+                    const item = cart.find((ci) => cartId(ci) === cid);
+                    if (!item) return sum;
+                    const modTotal = (item.modifiers || []).reduce((s, m) => s + m.price, 0);
+                    return sum + (item.product.price + modTotal) * qty;
+                  }, 0);
+                  const hasItems = Object.values(person.itemQty).some((q) => q > 0);
+                  return (
+                    <div key={person.id} className={`border rounded-lg p-3 ${hasItems ? 'border-blue-200 bg-blue-50/50' : 'border-gray-200 bg-gray-50'}`}>
+                      <div className="text-xs font-semibold text-gray-500 uppercase">{person.name || `Orang ${pi + 1}`}</div>
+                      <div className="text-lg font-extrabold text-gray-900 mt-1">Rp {total.toLocaleString()}</div>
+                      {!hasItems && <div className="text-xs text-gray-400 mt-1">Belum ada item</div>}
+                    </div>
+                  );
+                })}
+              </div>
+
+              {/* Grand total check */}
+              <div className="mt-4 flex justify-between items-center border-t border-gray-200 pt-4">
+                <span className="text-sm text-gray-500">Total Pesanan</span>
+                <span className="text-lg font-bold">Rp {grandTotal.toLocaleString()}</span>
+              </div>
+              <div className="flex justify-between items-center text-sm">
+                <span className="text-gray-500">Total Terbagi</span>
+                <span className={`font-bold ${splitPersons.reduce((s, p) => s + Object.entries(p.itemQty).reduce((sum, [cid, qty]) => {
+                  const item = cart.find((ci) => cartId(ci) === cid);
+                  if (!item) return sum;
+                  const modTotal = (item.modifiers || []).reduce((s, m) => s + m.price, 0);
+                  return sum + (item.product.price + modTotal) * qty;
+                }, 0), 0) === grandTotal ? 'text-green-600' : 'text-amber-600'}`}>
+                  Rp {splitPersons.reduce((s, p) => s + Object.entries(p.itemQty).reduce((sum, [cid, qty]) => {
+                    const item = cart.find((ci) => cartId(ci) === cid);
+                    if (!item) return sum;
+                    const modTotal = (item.modifiers || []).reduce((s, m) => s + m.price, 0);
+                    return sum + (item.product.price + modTotal) * qty;
+                  }, 0), 0).toLocaleString()}
+                </span>
+              </div>
+            </div>
+
+            <div className="p-6 border-t border-gray-100 shrink-0 flex flex-col gap-3">
+              <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
+                {splitPersons.map((person, pi) => {
+                  const hasItems = Object.values(person.itemQty).some((q) => q > 0);
+                  const personTotal = Object.entries(person.itemQty).reduce((sum, [cid, qty]) => {
+                    const item = cart.find((ci) => cartId(ci) === cid);
+                    if (!item) return sum;
+                    const modTotal = (item.modifiers || []).reduce((s, m) => s + m.price, 0);
+                    return sum + (item.product.price + modTotal) * qty;
+                  }, 0);
+                  return (
+                    <button
+                      key={person.id}
+                      disabled={!hasItems || person.paid}
+                      onClick={async () => {
+                        // Save cart, filter to this person's items, open payment
+                        setSavedSplitCart([...cart]);
+                        const personItemKeys = Object.entries(person.itemQty)
+                          .filter(([_, qty]) => qty > 0)
+                          .reduce((acc, [cid, qty]) => ({ ...acc, [cid]: qty }), {} as Record<string, number>);
+                        const filteredCart = cart
+                          .map((item) => {
+                            const key = cartId(item);
+                            const assigned = personItemKeys[key];
+                            if (!assigned) return null;
+                            return { ...item, qty: assigned };
+                          })
+                          .filter(Boolean) as typeof cart;
+                        setCart(filteredCart);
+                        setActiveSplitPersonId(person.id);
+                        setShowSplitBill(false);
+                        setPaymentSteps([]);
+                        setShowPaymentModal(true);
+                      }}
+                      className={`flex items-center gap-2 px-4 py-3 rounded-xl font-bold text-sm transition-colors ${
+                        person.paid
+                          ? 'bg-green-100 text-green-700 border border-green-300 cursor-default'
+                          : hasItems
+                            ? 'bg-[#2176D2] text-white hover:opacity-90'
+                            : 'bg-gray-100 text-gray-400 cursor-not-allowed'
+                      }`}
+                    >
+                      {person.paid ? (
+                        <span className="material-symbols-outlined text-[18px]">check_circle</span>
+                      ) : (
+                        <span className="material-symbols-outlined text-[18px]">payments</span>
+                      )}
+                      <span className="truncate">{person.name || `Orang ${pi + 1}`}</span>
+                      <span className="ml-auto text-xs opacity-80">Rp {personTotal.toLocaleString()}</span>
+                    </button>
+                  );
+                })}
+              </div>
+              <button onClick={() => setShowSplitBill(false)}
+                className="w-full py-3 bg-gray-200 text-gray-700 font-bold rounded-xl hover:bg-gray-300 transition-colors">
+                Tutup
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Open Bills Modal */}
+      {showOpenBills && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+          <div className="bg-white rounded-xl shadow-xl max-w-2xl w-full mx-4 max-h-[80vh] flex flex-col">
+            <div className="p-6 border-b border-gray-100 flex justify-between items-center shrink-0">
+              <div className="flex items-center gap-3">
+                <span className="material-symbols-outlined text-amber-500 text-[28px]">description</span>
+                <h3 className="text-lg font-bold text-gray-800">Pesanan Aktif</h3>
+              </div>
+              <button onClick={() => setShowOpenBills(false)} className="text-gray-400 hover:text-gray-600">
+                <span className="material-symbols-outlined text-[24px]">close</span>
+              </button>
+            </div>
+            <div className="flex-1 overflow-y-auto p-6">
+              {loadingOpenBills ? (
+                <p className="text-center text-gray-400 py-8">Memuat...</p>
+              ) : openBills.length === 0 ? (
+                <p className="text-center text-gray-400 py-8">Tidak ada pesanan aktif</p>
+              ) : (
+                <div className="space-y-4">
+                  {openBills.map((bill: any) => (
+                    <div key={bill._id} className="border border-gray-200 rounded-lg p-4 hover:border-amber-300 transition-colors">
+                      <div className="flex items-center justify-between mb-2">
+                        <div>
+                          <span className="font-bold text-gray-800">{bill.orderNumber}</span>
+                          <span className="text-xs text-gray-400 ml-2">
+                            {new Date(bill.createdAt).toLocaleString('id')}
+                          </span>
+                        </div>
+                        <span className="font-bold text-lg">Rp {(bill.total || 0).toLocaleString()}</span>
+                      </div>
+                      <div className="text-xs text-gray-500 mb-3">
+                        {bill.items?.map((item: any, i: number) => (
+                          <span key={i}>{item.product?.name || 'Unknown'} x{item.qty}{i < bill.items.length - 1 ? ', ' : ''}</span>
+                        ))}
+                        {bill.customerName && <span className="ml-2">- {bill.customerName}</span>}
+                        {bill.tableNumber && <span className="ml-2">| Meja {bill.tableNumber}</span>}
+                      </div>
+                      <button
+                        onClick={async () => {
+                          // Fetch full bill detail then load into cart
+                          const token = localStorage.getItem('token');
+                          const detailRes = await fetch(`/api/orders/${bill._id}`, {
+                            headers: { Authorization: `Bearer ${token}` },
+                          });
+                          if (!detailRes.ok) return;
+                          const detail = await detailRes.json();
+                          const loadedCart = (detail.items || []).map((item: any) => ({
+                            product: item.product,
+                            qty: item.qty,
+                            modifiers: item.modifiers || [],
+                          }));
+                          setCart(loadedCart);
+                          setLoadedOpenBillId(bill._id);
+                          setShowOpenBills(false);
+                        }}
+                        className="w-full py-2 bg-amber-500 text-white font-bold rounded-lg hover:bg-amber-600 transition-colors text-sm"
+                      >
+                        Muat ke Kasir
                       </button>
                     </div>
-                    {showMemberSearch && memberResults.length > 0 && (
-                      <div className="absolute z-10 mt-1 w-full bg-white border border-gray-200 rounded-lg shadow-lg max-h-40 overflow-y-auto">
-                        {memberResults.map((m) => (
-                          <button key={m._id} onClick={() => selectMember(m)}
-                            className="w-full text-left px-3 py-2 hover:bg-blue-50 text-sm flex items-center gap-2 border-b border-gray-100 last:border-0">
-                            <span className="material-symbols-outlined text-gray-400 text-[16px]">person</span>
-                            <span className="font-medium">{m.name}</span>
-                            <span className="text-gray-400 text-xs">{m.phone}</span>
-                          </button>
-                        ))}
-                      </div>
-                    )}
-                  </div>
-                )}
-              </div>
-
-              {/* Promo Code */}
-              <div>
-                <label className="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-2 block">Promo</label>
-                <div className="flex gap-2">
-                  <input type="text" placeholder="Kode Promo" value={promoCode}
-                    onChange={(e) => { setPromoCode(e.target.value); setPromoApplied(null); setPromoError(''); }}
-                    disabled={!!promoApplied}
-                    className="flex-1 px-3 py-2 border border-gray-200 rounded-lg text-sm font-mono focus:ring-blue-500 focus:border-blue-500 disabled:bg-gray-100" />
-                  {promoApplied ? (
-                    <button onClick={removePromoCode} className="px-3 py-2 text-sm font-semibold text-red-600 bg-red-50 rounded-lg hover:bg-red-100">
-                      Batal
-                    </button>
-                  ) : (
-                    <button onClick={applyPromoCode} disabled={!promoCode.trim()}
-                      className="px-3 py-2 text-sm font-semibold text-white bg-[#2176D2] rounded-lg hover:opacity-90 disabled:opacity-50">
-                      Pakai
-                    </button>
-                  )}
-                </div>
-                {promoError && <p className="text-xs text-red-500 mt-1">{promoError}</p>}
-                {promoApplied && <p className="text-xs text-green-600 font-semibold mt-1">✓ {promoApplied.name}</p>}
-              </div>
-
-              {/* Payment Method */}
-              <div>
-                <label className="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-2 block">Metode Pembayaran</label>
-                <div className="flex gap-2 flex-wrap">
-                  {paymentMethods.filter((pm) => pm.active).map((pm) => (
-                    <button key={pm._id} onClick={() => { setPaymentMethod(pm._id); setCardLastFour(''); }}
-                      className={`flex-1 min-w-[80px] py-3 rounded-lg text-sm font-semibold transition-colors ${
-                        paymentMethod === pm._id
-                          ? 'bg-[#2176D2] text-white'
-                          : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
-                      }`}>
-                      {pm.name}
-                    </button>
                   ))}
-                </div>
-              </div>
-
-              {/* Cash Amount */}
-              {isCash && (
-                <div>
-                  <input type="number" placeholder="Jumlah Bayar" value={cashAmount}
-                    onChange={(e) => setCashAmount(e.target.value)}
-                    className="w-full px-4 py-3 border border-gray-200 rounded-lg text-sm focus:ring-blue-500 focus:border-blue-500" />
-                  {cashAmount && (
-                    <div className={`mt-2 text-sm font-semibold ${change >= 0 ? 'text-green-600' : 'text-red-500'}`}>
-                      {change >= 0
-                        ? `Kembalian: Rp ${change.toLocaleString()}`
-                        : `Uang kurang Rp ${Math.abs(change).toLocaleString()}`
-                      }
-                    </div>
-                  )}
-                </div>
-              )}
-
-              {/* Card Last Four */}
-              {selectedPM?.requiresCardLastFour && (
-                <div>
-                  <input type="text" placeholder="4 Digit Terakhir Kartu" maxLength={4} value={cardLastFour}
-                    onChange={(e) => setCardLastFour(e.target.value.replace(/\D/g, '').slice(0, 4))}
-                    className="w-full px-4 py-3 border border-gray-200 rounded-lg text-sm focus:ring-blue-500 focus:border-blue-500" />
                 </div>
               )}
             </div>
+          </div>
+        </div>
+      )}
 
-            {/* Footer Total + Actions */}
-            <div className="p-6 border-t border-gray-100 shrink-0 space-y-4">
-              {promoApplied && (
-                <div className="flex justify-between text-sm text-green-600 font-semibold">
-                  <span>Promo: {promoApplied.name}</span>
-                  <span>- Rp {estimatedDiscount.toLocaleString()}</span>
+      {/* Payment Modal */}
+      {showPaymentModal && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+          <div className="bg-white rounded-xl shadow-xl max-w-4xl w-full mx-4 h-[90vh] flex flex-col">
+            <div className="px-5 py-4 border-b border-gray-100 flex justify-between items-center shrink-0">
+              <h3 className="text-lg font-bold text-gray-800">Pembayaran</h3>
+              <button onClick={() => {
+                setShowPaymentModal(false);
+                setPaymentSteps([]);
+                if (activeSplitPersonId) {
+                  if (savedSplitCart) setCart(savedSplitCart);
+                  setSavedSplitCart(null);
+                  setActiveSplitPersonId(null);
+                  setShowSplitBill(true);
+                }
+              }} className="text-gray-400 hover:text-gray-600">
+                <span className="material-symbols-outlined text-[24px]">close</span>
+              </button>
+            </div>
+
+            <div className="flex-1 flex p-5 gap-5 min-h-0">
+              {/* Left: Payment Methods */}
+              <div className="flex-[3] flex flex-col min-h-0">
+                {/* Member + Promo row */}
+                <div className="flex gap-3 mb-4 shrink-0">
+                  <div className="flex-1">
+                    {selectedMember ? (
+                      <div className="flex items-center justify-between bg-blue-50 rounded-lg px-3 py-2">
+                        <div className="flex items-center gap-2">
+                          <span className="material-symbols-outlined text-[#2176D2] text-[18px]">diversity_3</span>
+                          <span className="text-sm font-semibold text-gray-800">{selectedMember.name}</span>
+                          <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded ${
+                            selectedMember.tier === 'platinum' ? 'bg-purple-100 text-purple-700' :
+                            selectedMember.tier === 'gold' ? 'bg-yellow-100 text-yellow-700' :
+                            selectedMember.tier === 'silver' ? 'bg-gray-100 text-gray-600' :
+                            'bg-gray-50 text-gray-500'
+                          }`}>
+                            {selectedMember.tier.charAt(0).toUpperCase() + selectedMember.tier.slice(1)}
+                          </span>
+                        </div>
+                        <button onClick={() => setSelectedMember(null)} className="text-gray-400 hover:text-red-500">
+                          <span className="material-symbols-outlined text-[18px]">close</span>
+                        </button>
+                      </div>
+                    ) : (
+                      <div className="flex gap-2">
+                        <input type="text" placeholder="Cari Member" value={memberSearch}
+                          onChange={(e) => searchMember(e.target.value)}
+                          onFocus={() => setShowMemberSearch(true)}
+                          className="flex-1 px-3 py-2 border border-gray-200 rounded-lg text-sm focus:ring-blue-500 focus:border-blue-500" />
+                        <button onClick={() => setShowMemberSearch(!showMemberSearch)}
+                          className="px-3 py-2 text-sm font-semibold text-[#2176D2] bg-blue-50 rounded-lg hover:bg-blue-100">Cari</button>
+                      </div>
+                    )}
+                  </div>
+                  <div className="flex-1">
+                    <div className="flex gap-2">
+                      <input type="text" placeholder="Kode Promo" value={promoCode}
+                        onChange={(e) => { setPromoCode(e.target.value); setPromoApplied(null); setPromoError(''); }}
+                        disabled={!!promoApplied}
+                        className="flex-1 px-3 py-2 border border-gray-200 rounded-lg text-sm font-mono focus:ring-blue-500 focus:border-blue-500 disabled:bg-gray-100" />
+                      {promoApplied ? (
+                        <button onClick={removePromoCode} className="px-3 py-2 text-sm font-semibold text-red-600 bg-red-50 rounded-lg hover:bg-red-100">Batal</button>
+                      ) : (
+                        <button onClick={applyPromoCode} disabled={!promoCode.trim()}
+                          className="px-3 py-2 text-sm font-semibold text-white bg-[#2176D2] rounded-lg hover:opacity-90 disabled:opacity-50">Pakai</button>
+                      )}
+                    </div>
+                    {promoError && <p className="text-xs text-red-500 mt-1">{promoError}</p>}
+                    {promoApplied && <p className="text-xs text-green-600 font-semibold mt-1">✓ {promoApplied.name}</p>}
+                  </div>
                 </div>
-              )}
-              {!promoApplied && estimatedDiscount > 0 && (
-                <div className="flex justify-between text-sm text-green-600 font-semibold">
-                  <span>Diskon Promo {promoPct > 0 && `(${promoPct}%)`}</span>
-                  <span>- Rp {estimatedDiscount.toLocaleString()}</span>
+
+                {/* Payment method list - scrollable */}
+                <div className="flex-1 overflow-y-auto space-y-2 min-h-0">
+                  {paymentSteps.map((step, si) => {
+                    const pm = paymentMethods.find((p) => p._id === step.methodId);
+                    const isSingleCash = paymentSteps.length === 1 && pm?.type === 'cash';
+                    return (
+                      <div key={si} className={`border rounded-lg p-3 ${isSingleCash && remainingAmount === 0 ? 'border-green-300 bg-green-50/50' : 'border-[#2176D2] bg-blue-50/50'}`}>
+                        <div className="flex items-center justify-between">
+                          <div className="flex items-center gap-2">
+                            <span className="material-symbols-outlined text-[#2176D2] text-[18px]">
+                              {pm?.type === 'cash' ? 'payments' : 'credit_card'}
+                            </span>
+                            <span className="font-semibold text-sm">{pm?.name || 'Unknown'}</span>
+                            <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded ${pm?.type === 'cash' ? 'bg-green-100 text-green-700' : 'bg-blue-100 text-blue-700'}`}>
+                              {pm?.type === 'cash' ? 'Tunai' : 'Non Tunai'}
+                            </span>
+                          </div>
+                          <button onClick={() => setPaymentSteps((prev) => prev.filter((_, i) => i !== si))}
+                            className="text-gray-400 hover:text-red-500">
+                            <span className="material-symbols-outlined text-[18px]">remove_circle</span>
+                          </button>
+                        </div>
+                        <div className="mt-2 flex items-center gap-2">
+                          <input type="number" placeholder="Jumlah" value={step.amount}
+                            onChange={(e) => {
+                              const newVal = e.target.value;
+                              setPaymentSteps((prev) => {
+                                const updated = prev.map((s, i) => i === si ? { ...s, amount: newVal } : s);
+                                const currentTotal = updated.reduce((sum, st) => sum + (Number(st.amount) || 0), 0);
+                                const rest = Math.max(0, grandTotal - currentTotal);
+                                if (rest > 0 && updated.length === 1) {
+                                  const nextPm = paymentMethods.find((pm) => pm.active && pm._id !== updated[0].methodId);
+                                  if (nextPm) {
+                                    const rounded = getRoundedAmount(rest, nextPm.type);
+                                    updated.push({ methodId: nextPm._id, amount: String(rounded), cardLastFour: '' });
+                                  }
+                                } else if (rest <= 0 && updated.length > 1) {
+                                  return [updated[0]];
+                                }
+                                return updated;
+                              });
+                            }}
+                            className="flex-1 px-3 py-2 border border-gray-200 rounded-lg text-sm focus:ring-blue-500 focus:border-blue-500" />
+                          {remainingAmount > 0 && (
+                            <button onClick={() => setPaymentSteps((prev) => prev.map((s, i) => i === si ? { ...s, amount: String(getRoundedAmount(remainingAmount, pm?.type)) } : s))}
+                              className="px-3 py-2 text-xs font-semibold text-[#2176D2] bg-blue-50 rounded-lg hover:bg-blue-100 shrink-0">Sisa</button>
+                          )}
+                        </div>
+                        {pm?.requiresCardLastFour && (
+                          <input type="text" placeholder="4 Digit Terakhir Kartu" maxLength={4} value={step.cardLastFour}
+                            onChange={(e) => setPaymentSteps((prev) => prev.map((s, i) => i === si ? { ...s, cardLastFour: e.target.value.replace(/\D/g, '').slice(0, 4) } : s))}
+                            className="mt-2 w-full px-3 py-2 border border-gray-200 rounded-lg text-sm focus:ring-blue-500 focus:border-blue-500" />
+                        )}
+                        {isSingleCash && remainingAmount === 0 && roundingInfo && roundingInfo.roundingAdjustment !== 0 && (
+                          <div className="mt-2 text-xs text-amber-600 font-semibold">
+                            Pembulatan: Rp {grandTotal.toLocaleString()} → Rp {effectivePayable.toLocaleString()}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+
+                  {remainingAmount > 0 && (
+                    <div className="border-2 border-dashed border-gray-300 rounded-lg p-3">
+                      <p className="text-xs font-semibold text-amber-600 mb-2">Sisa Rp {remainingAmount.toLocaleString()}</p>
+                      <div className="flex gap-2 flex-wrap">
+                        {paymentMethods.filter((pm) => pm.active && !paymentSteps.some((s) => s.methodId === pm._id)).map((pm) => (
+                          <button key={pm._id}
+                            onClick={() => setPaymentSteps((prev) => [...prev, { methodId: pm._id, amount: String(getRoundedAmount(remainingAmount, pm.type)), cardLastFour: '' }])}
+                            className="flex items-center gap-1 px-3 py-1.5 bg-white border border-gray-200 rounded-lg text-xs font-semibold text-gray-700 hover:border-[#2176D2] hover:text-[#2176D2] transition-colors">
+                            <span className="material-symbols-outlined text-[14px]">{pm.type === 'cash' ? 'payments' : 'credit_card'}</span>
+                            {pm.name}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {paymentSteps.length === 0 && (
+                    <div className="border-2 border-dashed border-gray-300 rounded-lg p-4">
+                      <p className="text-xs text-gray-400 mb-3">Pilih metode pembayaran:</p>
+                      <div className="flex gap-2 flex-wrap">
+                        {paymentMethods.filter((pm) => pm.active).map((pm) => (
+                          <button key={pm._id}
+                            onClick={() => setPaymentSteps([{ methodId: pm._id, amount: String(getRoundedAmount(grandTotal, pm.type)), cardLastFour: '' }])}
+                            className="flex items-center gap-1.5 px-4 py-2 bg-white border border-gray-200 rounded-lg text-sm font-semibold text-gray-700 hover:border-[#2176D2] hover:text-[#2176D2] transition-colors">
+                            <span className="material-symbols-outlined text-[16px]">{pm.type === 'cash' ? 'payments' : 'credit_card'}</span>
+                            {pm.name}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  )}
                 </div>
-              )}
-              <div className="flex justify-between items-center">
-                <span className="text-base text-gray-700">Total</span>
-                <span className="text-2xl font-extrabold text-gray-900">Rp {grandTotal.toLocaleString()}</span>
               </div>
-              <div className="flex gap-3">
-                <button onClick={() => setShowPaymentModal(false)}
-                  className="flex-1 py-3 bg-gray-200 text-gray-700 font-bold rounded-xl hover:bg-gray-300 transition-colors">
-                  Batal
-                </button>
-                <button onClick={() => { setShowPaymentModal(false); checkout(); }}
-                  disabled={(isCash && (!cashAmount || change < 0)) || (selectedPM?.requiresCardLastFour && cardLastFour.length !== 4)}
-                  className="flex-[2] py-3 bg-[#2176D2] text-white font-bold rounded-xl hover:opacity-90 transition-opacity disabled:opacity-50">
-                  Bayar Rp {grandTotal.toLocaleString()}
-                </button>
+
+              {/* Right: Summary */}
+              <div className="flex-[2] flex flex-col">
+                <div className="flex-1 bg-gray-50 rounded-xl p-4 flex flex-col justify-between">
+                  <div className="space-y-2 text-sm">
+                    <div className="flex justify-between">
+                      <span className="text-gray-500">Subtotal</span>
+                      <span>Rp {subtotal.toLocaleString()}</span>
+                    </div>
+                    {estimatedDiscount > 0 && (
+                      <div className="flex justify-between text-green-600 font-semibold">
+                        <span>Diskon{promoApplied ? ` (${promoApplied.name})` : promoPct > 0 ? ` (${promoPct}%)` : ''}</span>
+                        <span>- Rp {estimatedDiscount.toLocaleString()}</span>
+                      </div>
+                    )}
+                    {dppTaxDetails.map((t: any, i: number) => (
+                      <div key={i} className="flex justify-between text-gray-600">
+                        <span>
+                          {t.name} ({t.effectiveRate || t.rate}%)
+                          {t.dppFormula?.type === 'fraction' && <span className="text-[10px] ml-1 font-mono">DPP {t.dppFormula.fraction.numerator}/{t.dppFormula.fraction.denominator}</span>}
+                        </span>
+                        <span className={t.addAmount > 0 ? 'font-semibold text-amber-700' : 'text-gray-400'}>
+                          {t.addAmount > 0 ? '+' : ''}Rp {(t.amount || 0).toLocaleString()}
+                        </span>
+                      </div>
+                    ))}
+                    {roundingInfo && roundingInfo.roundingAdjustment !== 0 && (
+                      <div className="flex justify-between text-amber-600 font-semibold">
+                        <span>Pembulatan ({roundingInfo.roundingMethod.replace(/_/g, ' ')})</span>
+                        <span>{roundingInfo.roundingAdjustment > 0 ? '+Rp ' : '-Rp '}{Math.abs(roundingInfo.roundingAdjustment).toLocaleString()}</span>
+                      </div>
+                    )}
+                    <div className="border-t border-gray-300 pt-2">
+                      <div className="flex justify-between items-center font-bold text-base">
+                        <span>Total</span>
+                        <span>Rp {effectivePayable.toLocaleString()}</span>
+                      </div>
+                    </div>
+                    {paymentSteps.length > 0 && (
+                      <div className="border-t border-dashed border-gray-200 pt-2 space-y-1">
+                        {paymentSteps.map((st, i) => {
+                          const pm = paymentMethods.find((p) => p._id === st.methodId);
+                          return (
+                            <div key={i} className="flex justify-between text-xs">
+                              <span className="text-gray-500">{pm?.name || 'Unknown'}</span>
+                              <span className="font-semibold text-gray-700">Rp {(Number(st.amount) || 0).toLocaleString()}</span>
+                            </div>
+                          );
+                        })}
+                        {remainingAmount > 0 && (
+                          <div className="flex justify-between text-xs font-bold text-amber-600 border-t border-dashed border-gray-200 pt-1">
+                            <span>Sisa</span>
+                            <span>Rp {remainingAmount.toLocaleString()}</span>
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                  <div className="space-y-3 pt-4">
+                    <button onClick={() => { setShowPaymentModal(false); checkout(); }}
+                      disabled={!isPaymentComplete || paymentSteps.some((st) => {
+                        const pm = paymentMethods.find((p) => p._id === st.methodId);
+                        return pm?.requiresCardLastFour && st.cardLastFour.length !== 4;
+                      })}
+                      className="w-full py-4 bg-[#2176D2] text-white font-bold rounded-xl hover:opacity-90 transition-opacity disabled:opacity-50 text-lg">
+                      Bayar Rp {effectivePayable.toLocaleString()}
+                    </button>
+                    <button onClick={() => {
+                      setShowPaymentModal(false);
+                      setPaymentSteps([]);
+                      if (activeSplitPersonId) {
+                        if (savedSplitCart) setCart(savedSplitCart);
+                        setSavedSplitCart(null);
+                        setActiveSplitPersonId(null);
+                        setShowSplitBill(true);
+                      }
+                    }}
+                      className="w-full py-3 bg-gray-200 text-gray-700 font-bold rounded-xl hover:bg-gray-300 transition-colors">
+                      Batal
+                    </button>
+                  </div>
+                </div>
               </div>
             </div>
           </div>
@@ -1478,12 +2175,20 @@ export default function Cashier() {
                 <span>-Rp {lastOrder.discountTotal?.toLocaleString()}</span>
               </div>
             )}
-            {lastOrder.taxDetails?.length > 0 && lastOrder.taxDetails.map((t: any, i: number) => (
+            {lastOrder.taxDetails?.length > 0 && lastOrder.taxDetails.map((t: any, i: number) => {
+              const dppLabel = t.dppType === 'fraction' && t.dppFraction
+                ? `DPP ${t.dppFraction.numerator}/${t.dppFraction.denominator}`
+                : undefined;
+              return (
               <div key={i} className={`flex justify-between text-sm ${t.included ? 'text-amber-700' : 'text-gray-500'}`}>
-                <span>{t.name}{t.rate > 0 && ` (${t.rate}%)`}{t.included && <span className="text-[10px] ml-1 font-semibold">[Inc]</span>}</span>
-                <span>Rp {(t.amount || 0).toLocaleString()}</span>
+                <span>
+                  {t.name}{t.effectiveRate > 0 && ` (${t.effectiveRate}%)`}
+                  {dppLabel && <span className="text-[10px] ml-1 font-mono">{dppLabel}</span>}
+                  {t.included && <span className="text-[10px] ml-1 font-semibold">[Inc]</span>}
+                </span>
+                <span>Rp {(t.amountRounded ?? t.amount ?? 0).toLocaleString()}</span>
               </div>
-            ))}
+            )})}
             {lastOrder.voidedItems?.length > 0 && (
               <div className="border-t border-gray-100 pt-2 mt-2">
                 <h4 className="text-xs font-bold text-red-500 mb-1">VOID:</h4>
@@ -1501,14 +2206,37 @@ export default function Cashier() {
               </div>
             )}
             <div className="border-t border-gray-200 mt-2 pt-4 space-y-1">
+              {lastOrder.originalTotal && lastOrder.originalTotal !== lastOrder.total && (
+                <div className="flex justify-between text-sm text-gray-500">
+                  <span>Total Invoice</span>
+                  <span>Rp {lastOrder.originalTotal?.toLocaleString()}</span>
+                </div>
+              )}
+              {lastOrder.roundingAdjustment !== 0 && (
+                <div className="flex justify-between text-sm text-amber-600 font-semibold">
+                  <span>Pembulatan ({lastOrder.roundingMethod?.replace(/_/g, ' ')})</span>
+                  <span>{lastOrder.roundingAdjustment > 0 ? '+Rp ' : '-Rp '}{Math.abs(lastOrder.roundingAdjustment).toLocaleString()}</span>
+                </div>
+              )}
               <div className="flex justify-between font-bold text-base">
                 <span>Total</span>
                 <span>Rp {lastOrder.total?.toLocaleString()}</span>
               </div>
               <div className="flex justify-between text-sm text-gray-600">
                 <span>Metode</span>
-                <span className="font-semibold">{lastOrder.paymentMethodName || lastOrder.paymentMethod?.name || lastOrder.paymentMethodCode}</span>
+                <span className="font-semibold text-right">
+                  {lastOrder.paymentBreakdown?.length > 1
+                    ? lastOrder.paymentBreakdown.map((pb: any) => pb.paymentMethodName).join(' + ')
+                    : lastOrder.paymentMethodName || lastOrder.paymentMethod?.name || lastOrder.paymentMethodCode
+                  }
+                </span>
               </div>
+              {lastOrder.paymentBreakdown?.length > 1 && lastOrder.paymentBreakdown.map((pb: any, i: number) => (
+                <div key={i} className="flex justify-between text-xs text-gray-400 ml-4">
+                  <span>{pb.paymentMethodName}</span>
+                  <span>Rp {pb.roundedAmount?.toLocaleString()}</span>
+                </div>
+              ))}
               {lastOrder.memberName && (
                 <div className="flex justify-between text-sm text-gray-600">
                   <span>Member</span>
@@ -1548,7 +2276,16 @@ export default function Cashier() {
             </div>
             <div className="flex gap-3 mt-6">
               <button
-                onClick={() => setShowReceipt(false)}
+                onClick={() => {
+                  setShowReceipt(false);
+                  if (splitHasMore) {
+                    setSplitHasMore(false);
+                    if (savedSplitCart) setCart(savedSplitCart);
+                    setSavedSplitCart(null);
+                    setActiveSplitPersonId(null);
+                    setShowSplitBill(true);
+                  }
+                }}
                 className="flex-1 py-3 bg-gray-200 text-gray-700 font-bold rounded-xl hover:bg-gray-300 transition-colors"
               >
                 Tutup
@@ -1865,8 +2602,19 @@ export default function Cashier() {
               </div>
               <div className="flex justify-between text-sm text-gray-600">
                 <span>Metode Pembayaran</span>
-                <span className="font-semibold">{selectedOrder.paymentMethodName || 'N/A'}</span>
+                <span className="font-semibold text-right">
+                  {selectedOrder.paymentBreakdown?.length > 1
+                    ? selectedOrder.paymentBreakdown.map((pb: any) => pb.paymentMethodName).join(' + ')
+                    : selectedOrder.paymentMethodName || 'N/A'
+                  }
+                </span>
               </div>
+              {selectedOrder.paymentBreakdown?.length > 1 && selectedOrder.paymentBreakdown.map((pb: any, i: number) => (
+                <div key={i} className="flex justify-between text-xs text-gray-400 ml-4">
+                  <span>{pb.paymentMethodName}</span>
+                  <span>Rp {pb.roundedAmount?.toLocaleString()}</span>
+                </div>
+              ))}
               {selectedOrder.cashierName && (
                 <div className="flex justify-between text-sm text-gray-600">
                   <span>Kasir</span>
@@ -2152,6 +2900,32 @@ export default function Cashier() {
                   </div>
                 </div>
 
+                {/* Rincian Pajak & Pembulatan */}
+                {reportData.taxBreakdown?.length > 0 && (
+                <div>
+                  <h4 className="text-sm font-bold text-gray-700 mb-3 flex items-center gap-2">
+                    <span className="material-symbols-outlined text-[18px] text-gray-400">receipt_long</span>
+                    Rincian Pajak
+                  </h4>
+                  <div className="space-y-1">
+                    {reportData.taxBreakdown.map((t: any, i: number) => (
+                      <div key={i} className="flex justify-between text-sm py-1">
+                        <span className="text-gray-600">{t.name}</span>
+                        <span className="font-semibold text-gray-800">Rp {t.amount.toLocaleString()}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+                )}
+                {reportData.sales.roundingCount > 0 && (
+                <div className="flex justify-between text-sm border-t border-gray-200 pt-2">
+                  <span className="text-gray-600">Pembulatan ({reportData.sales.roundingCount} transaksi)</span>
+                  <span className={`font-semibold ${(reportData.sales.roundingAdjustment || 0) > 0 ? 'text-amber-600' : 'text-green-600'}`}>
+                    {(reportData.sales.roundingAdjustment || 0) > 0 ? '+Rp ' : '-Rp '}{Math.abs(reportData.sales.roundingAdjustment || 0).toLocaleString()}
+                  </span>
+                </div>
+                )}
+
                 {/* Uang Tunai di Laci */}
                 <div>
                   <h4 className="text-sm font-bold text-gray-700 mb-3 flex items-center gap-2">
@@ -2340,6 +3114,32 @@ export default function Cashier() {
             >
               <span className="material-symbols-outlined text-[24px] text-gray-400">receipt_long</span>
               Riwayat Transaksi
+            </button>
+            <button
+              onClick={async () => {
+                setShowSidebar(false);
+                setLoadingOpenBills(true);
+                setShowOpenBills(true);
+                const token = localStorage.getItem('token');
+                try {
+                  const res = await fetch('/api/orders?status=open', {
+                    headers: { Authorization: `Bearer ${token}` },
+                  });
+                  if (res.ok) {
+                    const data = await res.json();
+                    setOpenBills(data.orders || []);
+                  }
+                } finally {
+                  setLoadingOpenBills(false);
+                }
+              }}
+              className="flex items-center gap-3 w-full px-4 py-3 text-gray-700 hover:bg-gray-100 rounded-xl transition-colors font-medium"
+            >
+              <span className="material-symbols-outlined text-[24px] text-gray-400">description</span>
+              Pesanan Aktif
+              {openBills.length > 0 && (
+                <span className="ml-auto bg-amber-100 text-amber-700 text-[11px] font-bold px-2 py-0.5 rounded-full">{openBills.length}</span>
+              )}
             </button>
             <button
               onClick={() => { setShowSidebar(false); setShowCashierReport(true); fetchReport(); }}

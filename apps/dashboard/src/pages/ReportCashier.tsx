@@ -6,12 +6,15 @@ interface PaymentBreakdown {
   code: string;
   total: number;
   count: number;
+  rounding?: number;
 }
 
 interface CashierReport {
   cashierName: string;
   totalSales: number;
   totalTransactions: number;
+  roundingAdjustment: number;
+  taxBreakdown: { code: string; name: string; amount: number }[];
   paymentBreakdown: PaymentBreakdown[];
 }
 
@@ -77,12 +80,39 @@ export default function ReportCashier() {
               </div>
               <p className="font-bold text-lg">Rp {cashier.totalSales.toLocaleString()}</p>
             </div>
+
+            {cashier.taxBreakdown?.length > 0 && (
+            <div className="mb-4 p-3 bg-surface-container-low rounded-lg">
+              <p className="text-xs font-semibold text-outline uppercase tracking-wider mb-2">Rincian Pajak</p>
+              <div className="space-y-1">
+                {cashier.taxBreakdown.map((t, i) => (
+                  <div key={i} className="flex justify-between text-sm">
+                    <span className="text-on-surface-variant">{t.name}</span>
+                    <span className="font-semibold text-on-surface">Rp {t.amount.toLocaleString()}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+            )}
+
+            {cashier.roundingAdjustment !== 0 && (
+            <div className="mb-4 flex justify-between text-sm text-amber-600 font-semibold">
+              <span>Pembulatan</span>
+              <span>{cashier.roundingAdjustment > 0 ? '+Rp ' : '-Rp '}{Math.abs(cashier.roundingAdjustment).toLocaleString()}</span>
+            </div>
+            )}
+
             <div className="space-y-2">
               {cashier.paymentBreakdown.map((pm) => (
                 <div key={pm.code} className="flex items-center justify-between p-3 bg-surface-container-low rounded-lg">
                   <div>
                     <p className="font-semibold capitalize">{pm.method}</p>
                     <p className="text-sm text-on-surface-variant">{pm.count} transaksi</p>
+                    {pm.rounding && pm.rounding !== 0 && (
+                      <p className={`text-xs font-medium ${pm.rounding > 0 ? 'text-amber-600' : 'text-green-600'}`}>
+                        Pembulatan: {pm.rounding > 0 ? '+' : ''}Rp {pm.rounding.toLocaleString()}
+                      </p>
+                    )}
                   </div>
                   <p className="font-semibold">Rp {pm.total.toLocaleString()}</p>
                 </div>

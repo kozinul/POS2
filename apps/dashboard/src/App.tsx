@@ -10,6 +10,7 @@ import Families from './pages/Families';
 import Members from './pages/Members';
 import Promotions from './pages/Promotions';
 import Taxes from './pages/Taxes';
+import RoundingConfig from './pages/RoundingConfig';
 import PaymentMethods from './pages/PaymentMethods';
 import Modifiers from './pages/Modifiers';
 import Outlets from './pages/Outlets';
@@ -48,6 +49,7 @@ export default function App() {
           <Route path="members" element={<Members />} />
           <Route path="promotions" element={<Promotions />} />
           <Route path="taxes" element={<Taxes />} />
+          <Route path="rounding-config" element={<RoundingConfig />} />
           <Route path="payment-methods" element={<PaymentMethods />} />
           <Route path="modifiers" element={<Modifiers />} />
           <Route path="outlets" element={<Outlets />} />

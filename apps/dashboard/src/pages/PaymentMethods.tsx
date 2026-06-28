@@ -27,6 +27,8 @@ const PRESET_CODES = [
   'CASH', 'QRIS', 'DEBIT', 'CREDIT_CARD', 'TRANSFER', 'E_WALLET', 'EDC', 'GIRO', 'VOUCHER',
 ];
 
+
+
 export default function PaymentMethods() {
   const { token } = useAuth();
   const [methods, setMethods] = useState<PaymentMethod[]>([]);
@@ -62,9 +64,18 @@ export default function PaymentMethods() {
 
   async function save() {
     setError('');
+    const body = {
+      name: form.name,
+      code: form.code,
+      type: form.type,
+      requiresCardLastFour: form.requiresCardLastFour,
+      description: form.description || undefined,
+      active: form.active,
+      outlets: form.outlets,
+    };
     const url = editingId ? `/api/payment-methods/${editingId}` : '/api/payment-methods';
     const method = editingId ? 'PUT' : 'POST';
-    const res = await fetch(url, { method, headers, body: JSON.stringify(form) });
+    const res = await fetch(url, { method, headers, body: JSON.stringify(body) });
     if (!res.ok) {
       const data = await res.json();
       setError(data.message || 'Gagal menyimpan');
@@ -117,9 +128,7 @@ export default function PaymentMethods() {
                 <th className="p-table_cell_padding font-section-header text-section-header text-outline uppercase tracking-wider">Kode</th>
                 <th className="p-table_cell_padding font-section-header text-section-header text-outline uppercase tracking-wider">Nama</th>
                 <th className="p-table_cell_padding font-section-header text-section-header text-outline uppercase tracking-wider">Tipe</th>
-                <th className="p-table_cell_padding font-section-header text-section-header text-outline uppercase tracking-wider">4 Digit Kartu</th>
                 <th className="p-table_cell_padding font-section-header text-section-header text-outline uppercase tracking-wider">Deskripsi</th>
-                <th className="p-table_cell_padding font-section-header text-section-header text-outline uppercase tracking-wider">Outlet</th>
                 <th className="p-table_cell_padding font-section-header text-section-header text-outline uppercase tracking-wider">Status</th>
                 <th className="p-table_cell_padding font-section-header text-section-header text-outline uppercase tracking-wider">Aksi</th>
               </tr>
@@ -140,23 +149,7 @@ export default function PaymentMethods() {
                       {m.type === 'cash' ? 'Tunai' : 'Non Tunai'}
                     </span>
                   </td>
-                  <td className="p-table_cell_padding">
-                    {m.requiresCardLastFour
-                      ? <span className="material-symbols-outlined text-primary text-[18px]">check</span>
-                      : <span className="text-outline">-</span>
-                    }
-                  </td>
                   <td className="p-table_cell_padding font-body-md text-body-md text-on-surface-variant">{m.description || '-'}</td>
-                  <td className="p-table_cell_padding">
-                    <div className="flex flex-wrap gap-1">
-                      {m.outlets?.length > 0
-                        ? m.outlets.map((o) => (
-                            <span key={o._id} className="text-xs bg-surface-container-high text-on-surface-variant px-1.5 py-0.5 rounded">{o.code}</span>
-                          ))
-                        : <span className="text-xs text-gray-400 italic">Semua</span>
-                      }
-                    </div>
-                  </td>
                   <td className="p-table_cell_padding">
                     <span className={`status-pill ${m.active ? 'status-active' : 'status-inactive'}`}>{m.active ? 'Aktif' : 'Nonaktif'}</span>
                   </td>
@@ -173,7 +166,7 @@ export default function PaymentMethods() {
                 </tr>
               ))}
               {methods.length === 0 && (
-                <tr><td colSpan={8} className="p-table_cell_padding text-center text-on-surface-variant">Belum ada metode bayar</td></tr>
+                <tr><td colSpan={7} className="p-table_cell_padding text-center text-on-surface-variant">Belum ada metode bayar</td></tr>
               )}
             </tbody>
           </table>
@@ -181,10 +174,11 @@ export default function PaymentMethods() {
       </div>
 
       {showForm && (
-        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
-          <div className="bg-white rounded-xl shadow-xl w-full max-w-md mx-4 p-6 border border-outline-variant">
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 overflow-y-auto py-8">
+          <div className="bg-white rounded-xl shadow-xl w-full max-w-lg mx-4 p-6 border border-outline-variant">
             <h3 className="font-headline-sm text-headline-sm text-on-surface mb-4">{editingId ? 'Edit Metode Bayar' : 'Tambah Metode Bayar'}</h3>
             <div className="flex flex-col gap-3">
+              {/* Code */}
               <div>
                 <label className="text-sm font-semibold text-on-surface-variant mb-1 block">Kode (ID Akuntansi)</label>
                 <div className="flex gap-1 flex-wrap mb-2">
@@ -203,33 +197,26 @@ export default function PaymentMethods() {
                     </button>
                   ))}
                 </div>
-                <input
-                  placeholder="Atau ketik kode sendiri"
-                  value={form.code}
+                <input placeholder="Atau ketik kode sendiri" value={form.code}
                   onChange={(e) => setForm({ ...form, code: e.target.value.toUpperCase() })}
-                  className="w-full px-3 py-2 border border-outline-variant rounded-lg font-body-md text-body-md font-mono focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary"
-                />
+                  className="w-full px-3 py-2 border border-outline-variant rounded-lg text-sm font-mono focus:outline-none focus:ring-2 focus:ring-primary/20" />
               </div>
-              <input
-                placeholder="Nama Metode (contoh: Kartu Debit)"
-                value={form.name}
+              {/* Name */}
+              <input placeholder="Nama Metode (contoh: Kartu Debit)" value={form.name}
                 onChange={(e) => setForm({ ...form, name: e.target.value })}
-                className="w-full px-3 py-2 border border-outline-variant rounded-lg font-body-md text-body-md focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary"
-              />
+                className="w-full px-3 py-2 border border-outline-variant rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary/20" />
+              {/* Type */}
               <div>
                 <label className="text-sm font-semibold text-on-surface-variant mb-1 block">Tipe</label>
                 <div className="flex gap-2">
                   {TYPE_OPTIONS.map((opt) => (
-                    <button
-                      key={opt.value}
-                      type="button"
+                    <button key={opt.value} type="button"
                       onClick={() => setForm({ ...form, type: opt.value as 'cash' | 'non-cash', requiresCardLastFour: opt.value === 'cash' ? false : form.requiresCardLastFour })}
                       className={`flex-1 py-2 rounded-lg text-sm font-semibold transition-colors ${
                         form.type === opt.value
                           ? 'bg-primary text-white'
                           : 'bg-surface-container-low text-on-surface-variant hover:bg-surface-container-high'
-                      }`}
-                    >
+                      }`}>
                       {opt.label}
                     </button>
                   ))}
@@ -237,25 +224,24 @@ export default function PaymentMethods() {
               </div>
               {form.type === 'non-cash' && (
                 <label className="flex items-center gap-2 text-sm">
-                  <input
-                    type="checkbox"
-                    checked={form.requiresCardLastFour}
+                  <input type="checkbox" checked={form.requiresCardLastFour}
                     onChange={(e) => setForm({ ...form, requiresCardLastFour: e.target.checked })}
-                    className="rounded border-outline-variant"
-                  />
+                    className="rounded border-outline-variant" />
                   Perlu input 4 digit terakhir kartu
                 </label>
               )}
-              <input
-                placeholder="Deskripsi (opsional)"
-                value={form.description}
+              {/* Description */}
+              <input placeholder="Deskripsi (opsional)" value={form.description}
                 onChange={(e) => setForm({ ...form, description: e.target.value })}
-                className="w-full px-3 py-2 border border-outline-variant rounded-lg font-body-md text-body-md focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary"
-              />
+                className="w-full px-3 py-2 border border-outline-variant rounded-lg text-sm" />
+              {/* Active */}
               <label className="flex items-center gap-2 text-sm">
-                <input type="checkbox" checked={form.active} onChange={(e) => setForm({ ...form, active: e.target.checked })} className="rounded border-outline-variant" />
+                <input type="checkbox" checked={form.active}
+                  onChange={(e) => setForm({ ...form, active: e.target.checked })}
+                  className="rounded border-outline-variant" />
                 Aktif
               </label>
+              {/* Outlets */}
               <div className="border-t border-outline-variant pt-3">
                 <label className="text-sm font-semibold text-on-surface-variant mb-2 block">Terapkan di Outlet</label>
                 {outlets.length === 0 ? (
@@ -276,7 +262,7 @@ export default function PaymentMethods() {
                 )}
               </div>
             </div>
-            {error && <p className="text-sm text-red-600 bg-red-50 px-3 py-2 rounded-lg">{error}</p>}
+            {error && <p className="text-sm text-red-600 bg-red-50 px-3 py-2 rounded-lg mt-3">{error}</p>}
             <div className="flex items-center justify-end gap-3 mt-6">
               <button onClick={() => { setShowForm(false); setError(''); }} className="px-4 py-2 text-sm font-semibold text-on-surface-variant bg-surface-container-low rounded-lg hover:bg-surface-container-high transition-colors">Batal</button>
               <button onClick={save} className="px-4 py-2 text-sm font-bold text-white bg-primary rounded-lg hover:bg-primary/90 transition-colors shadow-sm">Simpan</button>

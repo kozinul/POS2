@@ -28,6 +28,7 @@ const navItems: NavEntry[] = [
       { to: '/members', icon: 'diversity_3', label: 'Member' },
       { to: '/promotions', icon: 'auto_awesome', label: 'Promosi' },
       { to: '/taxes', icon: 'receipt', label: 'Pajak' },
+      { to: '/rounding-config', icon: 'currency_exchange', label: 'Pembulatan' },
       { to: '/payment-methods', icon: 'payments', label: 'Metode Bayar' },
       { to: '/modifiers', icon: 'tune', label: 'Modifier / Opsi' },
     ],
